@@ -40,7 +40,7 @@ describe('chatSession workflow', () => {
       connection: testEnv.nativeConnection,
       taskQueue: 'test-chat',
       workflowsPath: workflowsPath,
-      activities: { streamClaude: fakeStreamClaude },
+      activities: { streamClaude: fakeStreamClaude, persistTurn: async () => {} },
     });
 
     await worker.runUntil(async () => {
@@ -89,7 +89,7 @@ describe('chatSession workflow', () => {
       connection: testEnv.nativeConnection,
       taskQueue: 'test-chat',
       workflowsPath: workflowsPath,
-      activities: { streamClaude: fakeStreamClaude },
+      activities: { streamClaude: fakeStreamClaude, persistTurn: async () => {} },
     });
 
     await worker.runUntil(async () => {

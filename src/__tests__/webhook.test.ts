@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { makeApp } from '../webhook.js';
+import type { Msg } from '../types.js';
 
 describe('webhook /message', () => {
   it('rejects missing fields with 400', async () => {
@@ -41,5 +42,49 @@ describe('webhook /message', () => {
       args: ['abc'],
       signalArgs: ['hello'],
     });
+  });
+});
+
+describe('webhook /sessions/:id/messages', () => {
+  it('returns messages from the injected reader', async () => {
+    const messages: Msg[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello there' },
+    ];
+    const getMessages = vi.fn().mockResolvedValue(messages);
+    const app = makeApp({
+      signalWithStart: vi.fn(),
+      taskQueue: 'chat',
+      getMessages,
+    });
+
+    const res = await app.request('/sessions/abc/messages');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ sessionId: 'abc', messages });
+    expect(getMessages).toHaveBeenCalledWith('abc');
+  });
+});
+
+describe('webhook /sessions/:id/stream', () => {
+  it('emits SSE events from the injected subscriber', async () => {
+    async function* fakeSubscribe() {
+      yield { id: '1-0', event: { type: 'delta' as const, text: 'hi' } };
+      yield { id: '2-0', event: { type: 'turn_end' as const } };
+    }
+    const subscribeDeltas = vi.fn(() => fakeSubscribe());
+    const app = makeApp({
+      signalWithStart: vi.fn(),
+      taskQueue: 'chat',
+      subscribeDeltas: subscribeDeltas as any,
+    });
+
+    const res = await app.request('/sessions/abc/stream');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const body = await res.text();
+    expect(body).toContain('id: 1-0');
+    expect(body).toContain('data: {"type":"delta","text":"hi"}');
+    expect(body).toContain('id: 2-0');
+    expect(body).toContain('data: {"type":"turn_end"}');
   });
 });
