@@ -167,6 +167,85 @@ describe('webhook PATCH /sessions/:id', () => {
     });
     expect(res.status).toBe(404);
   });
+
+  it('archives when archived=true provided', async () => {
+    const setSessionArchived = vi.fn().mockResolvedValue(true);
+    const app = makeApp({
+      signalWithStart: vi.fn(),
+      taskQueue: 'chat',
+      setSessionArchived,
+    });
+    const res = await app.request('/sessions/abc', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', ...AUTH },
+      body: JSON.stringify({ archived: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(setSessionArchived).toHaveBeenCalledWith('abc', USER, true);
+  });
+
+  it('rejects empty payload', async () => {
+    const app = makeApp({ signalWithStart: vi.fn(), taskQueue: 'chat' });
+    const res = await app.request('/sessions/abc', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', ...AUTH },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('webhook DELETE /sessions/:id', () => {
+  it('deletes when owned and signals the workflow', async () => {
+    const sessionBelongsTo = vi.fn().mockResolvedValue(true);
+    const deleteSession = vi.fn().mockResolvedValue(true);
+    const signalClose = vi.fn().mockResolvedValue(undefined);
+    const app = makeApp({
+      signalWithStart: vi.fn(),
+      taskQueue: 'chat',
+      sessionBelongsTo,
+      deleteSession,
+      signalClose,
+    });
+    const res = await app.request('/sessions/abc', {
+      method: 'DELETE',
+      headers: AUTH,
+    });
+    expect(res.status).toBe(200);
+    expect(signalClose).toHaveBeenCalledWith('chat:abc');
+    expect(deleteSession).toHaveBeenCalledWith('abc', USER);
+  });
+
+  it('returns 404 when not owned', async () => {
+    const app = makeApp({
+      signalWithStart: vi.fn(),
+      taskQueue: 'chat',
+      sessionBelongsTo: vi.fn().mockResolvedValue(false),
+    });
+    const res = await app.request('/sessions/abc', {
+      method: 'DELETE',
+      headers: AUTH,
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it('still deletes DB rows when signalClose throws', async () => {
+    const deleteSession = vi.fn().mockResolvedValue(true);
+    const signalClose = vi.fn().mockRejectedValue(new Error('not running'));
+    const app = makeApp({
+      signalWithStart: vi.fn(),
+      taskQueue: 'chat',
+      sessionBelongsTo: vi.fn().mockResolvedValue(true),
+      deleteSession,
+      signalClose,
+    });
+    const res = await app.request('/sessions/abc', {
+      method: 'DELETE',
+      headers: AUTH,
+    });
+    expect(res.status).toBe(200);
+    expect(deleteSession).toHaveBeenCalled();
+  });
 });
 
 describe('webhook /sessions/:id/stream', () => {

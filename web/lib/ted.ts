@@ -61,6 +61,31 @@ export async function renameSession(
   if (!res.ok) throw new Error(`ted /sessions PATCH ${res.status}`);
 }
 
+export async function setArchived(
+  userId: string,
+  sessionId: string,
+  archived: boolean,
+): Promise<void> {
+  const res = await tedFetch(userId, `/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ archived }),
+  });
+  if (!res.ok) throw new Error(`ted /sessions PATCH ${res.status}`);
+}
+
+export async function deleteSession(
+  userId: string,
+  sessionId: string,
+): Promise<void> {
+  const res = await tedFetch(userId, `/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`ted /sessions DELETE ${res.status}`);
+  }
+}
+
 /**
  * Open ted's SSE stream for a session. Returns the response so the caller
  * can pipe the body through to the browser.

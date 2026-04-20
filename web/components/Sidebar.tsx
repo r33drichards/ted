@@ -1,13 +1,15 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 
 type Row = { id: string; title: string | null; updated_at: string };
 
 export default function Sidebar() {
   const [rows, setRows] = useState<Row[]>([]);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
   const pathname = usePathname();
+  const router = useRouter();
 
   async function refresh() {
     try {
@@ -27,6 +29,39 @@ export default function Sidebar() {
     return () => clearInterval(t);
   }, [pathname]);
 
+  // Click-outside closes the menu.
+  useEffect(() => {
+    const close = () => setOpenMenu(null);
+    if (openMenu) {
+      window.addEventListener('click', close);
+      return () => window.removeEventListener('click', close);
+    }
+  }, [openMenu]);
+
+  async function archive(id: string) {
+    setOpenMenu(null);
+    // Optimistic drop from list.
+    setRows((prev) => prev.filter((r) => r.id !== id));
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ archived: true }),
+    });
+    if (!res.ok) await refresh(); // roll back via re-fetch
+    else if (pathname === `/chat/${id}`) router.push('/chat/new');
+  }
+
+  async function remove(id: string) {
+    setOpenMenu(null);
+    if (!confirm('Delete this chat permanently? This cannot be undone.')) return;
+    setRows((prev) => prev.filter((r) => r.id !== id));
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+    if (!res.ok) await refresh();
+    else if (pathname === `/chat/${id}`) router.push('/chat/new');
+  }
+
   return (
     <aside className="flex h-full w-64 flex-col border-r border-zinc-800 bg-zinc-900 p-3">
       <Link
@@ -43,10 +78,10 @@ export default function Sidebar() {
             {rows.map((r) => {
               const active = pathname === `/chat/${r.id}`;
               return (
-                <li key={r.id}>
+                <li key={r.id} className="group relative">
                   <Link
                     href={`/chat/${r.id}`}
-                    className={`block truncate rounded-md px-2 py-1.5 text-sm ${
+                    className={`block truncate rounded-md px-2 py-1.5 pr-8 text-sm ${
                       active
                         ? 'bg-zinc-800 text-white'
                         : 'text-zinc-300 hover:bg-zinc-800/60'
@@ -54,6 +89,38 @@ export default function Sidebar() {
                   >
                     {r.title ?? r.id.slice(0, 8)}
                   </Link>
+                  <button
+                    type="button"
+                    aria-label="Chat options"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setOpenMenu((cur) => (cur === r.id ? null : r.id));
+                    }}
+                    className="absolute right-1 top-1 hidden rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100 group-hover:inline-block"
+                  >
+                    ...
+                  </button>
+                  {openMenu === r.id && (
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className="absolute right-1 top-7 z-10 w-36 rounded-md border border-zinc-700 bg-zinc-900 py-1 text-sm shadow-lg"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => archive(r.id)}
+                        className="block w-full px-3 py-1.5 text-left text-zinc-200 hover:bg-zinc-800"
+                      >
+                        Archive
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => remove(r.id)}
+                        className="block w-full px-3 py-1.5 text-left text-red-400 hover:bg-zinc-800"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  )}
                 </li>
               );
             })}

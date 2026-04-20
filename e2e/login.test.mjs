@@ -145,6 +145,52 @@ try {
   console.log('✓ after reload, bubbles:', bubbles);
   assert.ok(bubbles.length >= 2, 'expected at least user + assistant bubbles after reload');
 
+  // --- Archive flow ---
+  // Seed a second chat to archive so we still have an active session left.
+  const prevUrl = page.url();
+  await page.getByRole('link', { name: /new chat/i }).click();
+  await page.waitForURL((u) => u.toString() !== prevUrl && /\/chat\//.test(u.toString()));
+  await page.getByPlaceholder('Message Ted').waitFor();
+  await page.getByPlaceholder('Message Ted').fill("Say 'one' only.");
+  await page.getByRole('button', { name: 'Send' }).click();
+  await page.locator('div.self-start.bg-zinc-800').last().waitFor();
+
+  // Sidebar polls /api/sessions every 5s — wait until both sessions appear.
+  await page.waitForFunction(
+    () =>
+      document.querySelectorAll('aside li').length >= 2,
+    { timeout: 15000 },
+  );
+
+  // Find a row that isn't the currently-active one, hover to reveal menu.
+  const activePath = new URL(page.url()).pathname;
+  const rowToArchive = page.locator('aside li').filter({
+    hasNot: page.locator(`a[href="${activePath}"]`),
+  }).first();
+  await rowToArchive.hover();
+  await rowToArchive.getByRole('button', { name: /chat options/i }).click();
+  await page.getByRole('button', { name: 'Archive', exact: true }).click();
+  // Poll until only one non-archived session remains.
+  await page.waitForFunction(
+    () =>
+      document.querySelectorAll('aside li').length === 1,
+    { timeout: 15000 },
+  );
+  const afterArchive = await page.locator('aside li a').allTextContents();
+  console.log('✓ sidebar after archive:', afterArchive);
+
+  // --- Delete flow ---
+  page.on('dialog', (d) => d.accept());
+  const remaining = page.locator('aside li').first();
+  await remaining.hover();
+  await remaining.getByRole('button', { name: /chat options/i }).click();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await page.waitForFunction(
+    () => document.querySelectorAll('aside li').length === 0,
+    { timeout: 15000 },
+  );
+  console.log('✓ sidebar after delete: empty');
+
   console.log('\n✅ E2E PASS');
 } catch (err) {
   console.error('\n❌ E2E FAIL:', err.message);

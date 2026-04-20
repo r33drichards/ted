@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions (user_id, updated_at DESC);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS sessions_user_active_idx ON sessions (user_id, archived, updated_at DESC);
 `;
 
 export async function ensureSchema(): Promise<void> {
@@ -82,14 +84,20 @@ export type SessionRow = {
   updated_at: string;
 };
 
-export async function getSessions(userId: string): Promise<SessionRow[]> {
-  const { rows } = await getPool().query<SessionRow>(
-    `SELECT id, title, updated_at
-       FROM sessions
-      WHERE user_id = $1
-      ORDER BY updated_at DESC`,
-    [userId],
-  );
+export async function getSessions(
+  userId: string,
+  opts: { includeArchived?: boolean } = {},
+): Promise<SessionRow[]> {
+  const sql = opts.includeArchived
+    ? `SELECT id, title, updated_at
+         FROM sessions
+        WHERE user_id = $1
+        ORDER BY updated_at DESC`
+    : `SELECT id, title, updated_at
+         FROM sessions
+        WHERE user_id = $1 AND archived = FALSE
+        ORDER BY updated_at DESC`;
+  const { rows } = await getPool().query<SessionRow>(sql, [userId]);
   return rows;
 }
 
@@ -128,6 +136,54 @@ export async function renameSession(
     [sessionId, userId, title],
   );
   return (res.rowCount ?? 0) > 0;
+}
+
+export async function setSessionArchived(
+  sessionId: string,
+  userId: string,
+  archived: boolean,
+): Promise<boolean> {
+  const res = await getPool().query(
+    'UPDATE sessions SET archived = $3, updated_at = now() WHERE id = $1 AND user_id = $2',
+    [sessionId, userId, archived],
+  );
+  return (res.rowCount ?? 0) > 0;
+}
+
+/**
+ * Hard-delete a session + its messages. Transactional — either both rows
+ * go or nothing. Returns true iff the session existed and was owned by
+ * the caller.
+ */
+export async function deleteSession(
+  sessionId: string,
+  userId: string,
+): Promise<boolean> {
+  const pool = getPool();
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const owns = await c.query<{ exists: boolean }>(
+      'SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1 AND user_id = $2) AS exists',
+      [sessionId, userId],
+    );
+    if (!owns.rows[0]?.exists) {
+      await c.query('ROLLBACK');
+      return false;
+    }
+    await c.query('DELETE FROM messages WHERE session_id = $1', [sessionId]);
+    await c.query('DELETE FROM sessions WHERE id = $1 AND user_id = $2', [
+      sessionId,
+      userId,
+    ]);
+    await c.query('COMMIT');
+    return true;
+  } catch (err) {
+    await c.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    c.release();
+  }
 }
 
 export async function sessionBelongsTo(

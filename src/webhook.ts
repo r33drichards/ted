@@ -11,8 +11,11 @@ import {
   createSession,
   sessionBelongsTo,
   renameSession,
+  setSessionArchived,
+  deleteSession,
 } from './db.js';
 import { subscribeDeltas } from './publish.js';
+import { closeSignal } from './signals.js';
 
 export type SignalWithStartFn = (
   workflow: typeof chatSession,
@@ -25,6 +28,8 @@ export type SignalWithStartFn = (
   },
 ) => Promise<{ workflowId: string }>;
 
+export type SignalCloseFn = (workflowId: string) => Promise<void>;
+
 export type AppDeps = {
   signalWithStart: SignalWithStartFn;
   taskQueue: string;
@@ -34,7 +39,12 @@ export type AppDeps = {
   createSession?: typeof createSession;
   sessionBelongsTo?: typeof sessionBelongsTo;
   renameSession?: typeof renameSession;
+  setSessionArchived?: typeof setSessionArchived;
+  deleteSession?: typeof deleteSession;
   subscribeDeltas?: typeof subscribeDeltas;
+  // Close the running workflow for this session. Best-effort — if the
+  // workflow isn't running this is a no-op.
+  signalClose?: SignalCloseFn;
 };
 
 type Vars = { userId: string };
@@ -46,6 +56,10 @@ export function makeApp(deps: AppDeps) {
   const recordSession = deps.createSession ?? createSession;
   const ownsSession = deps.sessionBelongsTo ?? sessionBelongsTo;
   const updateSessionTitle = deps.renameSession ?? renameSession;
+  const updateSessionArchived = deps.setSessionArchived ?? setSessionArchived;
+  const dropSession = deps.deleteSession ?? deleteSession;
+  const closeWorkflow: SignalCloseFn =
+    deps.signalClose ?? (async () => undefined);
   const subscribe = deps.subscribeDeltas ?? subscribeDeltas;
 
   // Auth middleware: require X-User-ID. Ted trusts the Next.js BFF on
@@ -115,11 +129,46 @@ export function makeApp(deps: AppDeps) {
   app.patch('/sessions/:sessionId', async (c) => {
     const userId = c.get('userId');
     const sessionId = c.req.param('sessionId');
-    const body = await c.req.json().catch(() => null);
-    if (!body || typeof body.title !== 'string') {
-      return c.json({ error: 'title required' }, 400);
+    const body = (await c.req.json().catch(() => null)) as
+      | { title?: unknown; archived?: unknown }
+      | null;
+    if (!body) return c.json({ error: 'invalid body' }, 400);
+
+    const hasTitle = typeof body.title === 'string';
+    const hasArchived = typeof body.archived === 'boolean';
+    if (!hasTitle && !hasArchived) {
+      return c.json({ error: 'title or archived required' }, 400);
     }
-    const ok = await updateSessionTitle(sessionId, userId, body.title);
+
+    if (hasTitle) {
+      const ok = await updateSessionTitle(sessionId, userId, body.title as string);
+      if (!ok) return c.json({ error: 'not found' }, 404);
+    }
+    if (hasArchived) {
+      const ok = await updateSessionArchived(
+        sessionId,
+        userId,
+        body.archived as boolean,
+      );
+      if (!ok) return c.json({ error: 'not found' }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.delete('/sessions/:sessionId', async (c) => {
+    const userId = c.get('userId');
+    const sessionId = c.req.param('sessionId');
+    if (!(await ownsSession(sessionId, userId))) {
+      return c.json({ error: 'not found' }, 404);
+    }
+    // Best-effort: tell the workflow (if any) to exit. Swallow errors — the
+    // workflow may have already completed or never existed.
+    try {
+      await closeWorkflow(`chat:${sessionId}`);
+    } catch {
+      /* ignore */
+    }
+    const ok = await dropSession(sessionId, userId);
     if (!ok) return c.json({ error: 'not found' }, 404);
     return c.json({ ok: true });
   });
@@ -172,6 +221,13 @@ async function main() {
     // generic signalWithStart — the test uses a narrower mock signature.
     signalWithStart: (wf, opts) => client.workflow.signalWithStart(wf, opts as any) as any,
     taskQueue,
+    signalClose: async (workflowId) => {
+      try {
+        await client.workflow.getHandle(workflowId).signal(closeSignal);
+      } catch {
+        /* workflow may be absent or already done; best-effort */
+      }
+    },
   });
 
   console.log(`Webhook listening on :${port}`);
