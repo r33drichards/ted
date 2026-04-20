@@ -12,7 +12,7 @@ async function main() {
     connection,
     namespace,
     taskQueue,
-    workflowsPath: new URL('./workflows.js', import.meta.url).pathname,
+    workflowsPath: new URL('./workflows.ts', import.meta.url).pathname,
     activities,
   });
 
