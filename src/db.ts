@@ -14,6 +14,8 @@ export function getPool(): pg.Pool {
 }
 
 const SCHEMA_SQL = `
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 CREATE TABLE IF NOT EXISTS messages (
   id          BIGSERIAL PRIMARY KEY,
   session_id  TEXT        NOT NULL,
@@ -35,6 +37,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions (user_id, updated_at DESC);
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS sessions_user_active_idx ON sessions (user_id, archived, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        TEXT        NOT NULL,
+  name           TEXT        NOT NULL,
+  url            TEXT        NOT NULL,
+  allowed_tools  JSONB       NOT NULL DEFAULT '[]'::jsonb,
+  enabled        BOOLEAN     NOT NULL DEFAULT true,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, name)
+);
+CREATE INDEX IF NOT EXISTS mcp_servers_user_enabled_idx
+  ON mcp_servers (user_id) WHERE enabled;
 `;
 
 export async function ensureSchema(): Promise<void> {
@@ -201,4 +217,148 @@ export async function closePool(): Promise<void> {
   if (!pool) return;
   await pool.end();
   pool = null;
+}
+
+export type McpServerRow = {
+  id: string;
+  user_id: string;
+  name: string;
+  url: string;
+  allowed_tools: string[];
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export class McpNameTakenError extends Error {
+  constructor(name: string) {
+    super(`mcp server name already exists: ${name}`);
+    this.name = 'McpNameTakenError';
+  }
+}
+
+const MCP_COLS =
+  'id, user_id, name, url, allowed_tools, enabled, created_at, updated_at';
+
+export async function listMcpServers(userId: string): Promise<McpServerRow[]> {
+  const { rows } = await getPool().query<McpServerRow>(
+    `SELECT ${MCP_COLS} FROM mcp_servers
+      WHERE user_id = $1
+      ORDER BY created_at ASC`,
+    [userId],
+  );
+  return rows;
+}
+
+export async function listEnabledMcpServers(
+  userId: string,
+): Promise<McpServerRow[]> {
+  const { rows } = await getPool().query<McpServerRow>(
+    `SELECT ${MCP_COLS} FROM mcp_servers
+      WHERE user_id = $1 AND enabled
+      ORDER BY created_at ASC`,
+    [userId],
+  );
+  return rows;
+}
+
+export type CreateMcpServerInput = {
+  name: string;
+  url: string;
+  allowed_tools?: string[];
+  enabled?: boolean;
+};
+
+export async function createMcpServer(
+  userId: string,
+  input: CreateMcpServerInput,
+): Promise<McpServerRow> {
+  try {
+    const { rows } = await getPool().query<McpServerRow>(
+      `INSERT INTO mcp_servers (user_id, name, url, allowed_tools, enabled)
+       VALUES ($1, $2, $3, $4::jsonb, $5)
+       RETURNING ${MCP_COLS}`,
+      [
+        userId,
+        input.name,
+        input.url,
+        JSON.stringify(input.allowed_tools ?? []),
+        input.enabled ?? true,
+      ],
+    );
+    return rows[0]!;
+  } catch (err) {
+    if ((err as { code?: string }).code === '23505') {
+      throw new McpNameTakenError(input.name);
+    }
+    throw err;
+  }
+}
+
+export type UpdateMcpServerPatch = Partial<{
+  name: string;
+  url: string;
+  allowed_tools: string[];
+  enabled: boolean;
+}>;
+
+export async function updateMcpServer(
+  id: string,
+  userId: string,
+  patch: UpdateMcpServerPatch,
+): Promise<McpServerRow | null> {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  if (patch.name !== undefined) {
+    params.push(patch.name);
+    sets.push(`name = $${params.length}`);
+  }
+  if (patch.url !== undefined) {
+    params.push(patch.url);
+    sets.push(`url = $${params.length}`);
+  }
+  if (patch.allowed_tools !== undefined) {
+    params.push(JSON.stringify(patch.allowed_tools));
+    sets.push(`allowed_tools = $${params.length}::jsonb`);
+  }
+  if (patch.enabled !== undefined) {
+    params.push(patch.enabled);
+    sets.push(`enabled = $${params.length}`);
+  }
+  if (sets.length === 0) {
+    const { rows } = await getPool().query<McpServerRow>(
+      `SELECT ${MCP_COLS} FROM mcp_servers WHERE id = $1 AND user_id = $2`,
+      [id, userId],
+    );
+    return rows[0] ?? null;
+  }
+  sets.push(`updated_at = now()`);
+  params.push(id, userId);
+  const idIdx = params.length - 1;
+  const userIdx = params.length;
+  try {
+    const { rows } = await getPool().query<McpServerRow>(
+      `UPDATE mcp_servers SET ${sets.join(', ')}
+        WHERE id = $${idIdx} AND user_id = $${userIdx}
+        RETURNING ${MCP_COLS}`,
+      params,
+    );
+    return rows[0] ?? null;
+  } catch (err) {
+    if ((err as { code?: string }).code === '23505') {
+      throw new McpNameTakenError(patch.name ?? '');
+    }
+    throw err;
+  }
+}
+
+export async function deleteMcpServer(
+  id: string,
+  userId: string,
+): Promise<boolean> {
+  const res = await getPool().query(
+    'DELETE FROM mcp_servers WHERE id = $1 AND user_id = $2',
+    [id, userId],
+  );
+  return (res.rowCount ?? 0) > 0;
 }

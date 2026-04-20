@@ -2,7 +2,13 @@ import Anthropic from '@anthropic-ai/sdk';
 import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
 import { heartbeat } from '@temporalio/activity';
 import { publishDelta, publishTurnEnd } from './publish.js';
-import { appendMessage, touchSession, renameSession } from './db.js';
+import {
+  appendMessage,
+  touchSession,
+  renameSession,
+  listEnabledMcpServers,
+  type McpServerRow,
+} from './db.js';
 import type { Role, StreamReq } from './types.js';
 
 // Bedrock when CLAUDE_CODE_USE_BEDROCK is set (any truthy value), else direct Anthropic API.
@@ -21,12 +27,54 @@ const MODEL =
     : 'claude-opus-4-5');
 const MAX_TOKENS = 4096;
 
+const MCP_BETA = 'mcp-client-2025-04-04';
+
+export type McpServerParam = {
+  type: 'url';
+  url: string;
+  name: string;
+  tool_configuration?: { allowed_tools: string[] };
+};
+
+export function buildMcpServersParam(
+  rows: McpServerRow[],
+): McpServerParam[] {
+  return rows.map((r) => ({
+    type: 'url' as const,
+    url: r.url,
+    name: r.name,
+    ...(r.allowed_tools.length > 0
+      ? { tool_configuration: { allowed_tools: r.allowed_tools } }
+      : {}),
+  }));
+}
+
 export async function streamClaude(req: StreamReq): Promise<string> {
-  const stream = client.messages.stream({
+  const mcpServers = useBedrock
+    ? []
+    : buildMcpServersParam(await listEnabledMcpServers(req.userId));
+
+  const params: Record<string, unknown> = {
     model: MODEL,
     max_tokens: MAX_TOKENS,
     messages: req.history,
-  });
+  };
+  const options: { headers?: Record<string, string> } = {};
+  if (mcpServers.length > 0) {
+    params.mcp_servers = mcpServers;
+    options.headers = { 'anthropic-beta': MCP_BETA };
+  }
+
+  // The stable SDK types don't yet know about `mcp_servers`; the beta header
+  // enables it on the wire. `client` is a union of Anthropic + Bedrock SDK
+  // instances with separate nominal types for params, so a shared cast can't
+  // narrow both — use `any` and rely on the wire format.
+  const stream = (client.messages as unknown as {
+    stream: (
+      p: unknown,
+      o?: unknown,
+    ) => ReturnType<typeof client.messages.stream>;
+  }).stream(params, options);
 
   try {
     for await (const event of stream) {

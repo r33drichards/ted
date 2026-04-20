@@ -49,7 +49,7 @@ export async function chatSession(
       await persistTurn({ sessionId, role: 'user', content: userTurn, userId });
     }
 
-    const text = await streamClaude({ sessionId, history });
+    const text = await streamClaude({ sessionId, history, userId });
     history.push({ role: 'assistant', content: text });
     await persistTurn({ sessionId, role: 'assistant', content: text, userId });
 

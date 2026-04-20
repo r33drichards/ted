@@ -86,6 +86,69 @@ export async function deleteSession(
   }
 }
 
+export type McpServer = {
+  id: string;
+  user_id: string;
+  name: string;
+  url: string;
+  allowed_tools: string[];
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type McpServerInput = {
+  name: string;
+  url: string;
+  allowed_tools?: string[];
+  enabled?: boolean;
+};
+
+export type McpServerPatch = Partial<McpServerInput>;
+
+export async function listMcpServers(userId: string): Promise<McpServer[]> {
+  const res = await tedFetch(userId, '/mcp/servers');
+  if (!res.ok) throw new Error(`ted /mcp/servers ${res.status}`);
+  const data = (await res.json()) as { servers: McpServer[] };
+  return data.servers;
+}
+
+export async function createMcpServer(
+  userId: string,
+  body: McpServerInput,
+): Promise<McpServer> {
+  const res = await tedFetch(userId, '/mcp/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`ted POST /mcp/servers ${res.status}: ${await res.text()}`);
+  const data = (await res.json()) as { server: McpServer };
+  return data.server;
+}
+
+export async function updateMcpServer(
+  userId: string,
+  id: string,
+  patch: McpServerPatch,
+): Promise<McpServer> {
+  const res = await tedFetch(userId, `/mcp/servers/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`ted PATCH /mcp/servers ${res.status}: ${await res.text()}`);
+  const data = (await res.json()) as { server: McpServer };
+  return data.server;
+}
+
+export async function deleteMcpServer(userId: string, id: string): Promise<void> {
+  const res = await tedFetch(userId, `/mcp/servers/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`ted DELETE /mcp/servers ${res.status}`);
+}
+
 /**
  * Open ted's SSE stream for a session. Returns the response so the caller
  * can pipe the body through to the browser.

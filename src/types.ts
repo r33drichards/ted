@@ -8,4 +8,5 @@ export type Msg = {
 export type StreamReq = {
   sessionId: string;
   history: Msg[];
+  userId: string;
 };

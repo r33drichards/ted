@@ -13,6 +13,11 @@ import {
   renameSession,
   setSessionArchived,
   deleteSession,
+  listMcpServers,
+  createMcpServer,
+  updateMcpServer,
+  deleteMcpServer,
+  McpNameTakenError,
 } from './db.js';
 import { subscribeDeltas } from './publish.js';
 import { closeSignal } from './signals.js';
@@ -42,12 +47,54 @@ export type AppDeps = {
   setSessionArchived?: typeof setSessionArchived;
   deleteSession?: typeof deleteSession;
   subscribeDeltas?: typeof subscribeDeltas;
+  listMcpServers?: typeof listMcpServers;
+  createMcpServer?: typeof createMcpServer;
+  updateMcpServer?: typeof updateMcpServer;
+  deleteMcpServer?: typeof deleteMcpServer;
   // Close the running workflow for this session. Best-effort — if the
   // workflow isn't running this is a no-op.
   signalClose?: SignalCloseFn;
 };
 
 type Vars = { userId: string };
+
+type McpValidateOpts = { requireName?: boolean; requireUrl?: boolean };
+
+function validateMcpBody(body: unknown, opts: McpValidateOpts): string | null {
+  if (!body || typeof body !== 'object') return 'invalid body';
+  const b = body as Record<string, unknown>;
+  if (opts.requireName && typeof b.name !== 'string') return 'name required';
+  if (b.name !== undefined) {
+    if (typeof b.name !== 'string' || !b.name || b.name.length > 128) {
+      return 'name must be a non-empty string up to 128 chars';
+    }
+  }
+  if (opts.requireUrl && typeof b.url !== 'string') return 'url required';
+  if (b.url !== undefined) {
+    if (typeof b.url !== 'string') return 'url must be a string';
+    let parsed: URL;
+    try {
+      parsed = new URL(b.url);
+    } catch {
+      return 'url is not a valid URL';
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return 'url must be http or https';
+    }
+  }
+  if (b.allowed_tools !== undefined) {
+    if (
+      !Array.isArray(b.allowed_tools) ||
+      !b.allowed_tools.every((t) => typeof t === 'string')
+    ) {
+      return 'allowed_tools must be an array of strings';
+    }
+  }
+  if (b.enabled !== undefined && typeof b.enabled !== 'boolean') {
+    return 'enabled must be a boolean';
+  }
+  return null;
+}
 
 export function makeApp(deps: AppDeps) {
   const app = new Hono<{ Variables: Vars }>();
@@ -61,6 +108,10 @@ export function makeApp(deps: AppDeps) {
   const closeWorkflow: SignalCloseFn =
     deps.signalClose ?? (async () => undefined);
   const subscribe = deps.subscribeDeltas ?? subscribeDeltas;
+  const mcpList = deps.listMcpServers ?? listMcpServers;
+  const mcpCreate = deps.createMcpServer ?? createMcpServer;
+  const mcpUpdate = deps.updateMcpServer ?? updateMcpServer;
+  const mcpDelete = deps.deleteMcpServer ?? deleteMcpServer;
 
   // Auth middleware: require X-User-ID. Ted trusts the Next.js BFF on
   // localhost to set this header after verifying a Keycloak session.
@@ -169,6 +220,66 @@ export function makeApp(deps: AppDeps) {
       /* ignore */
     }
     const ok = await dropSession(sessionId, userId);
+    if (!ok) return c.json({ error: 'not found' }, 404);
+    return c.json({ ok: true });
+  });
+
+  app.get('/mcp/servers', async (c) => {
+    const userId = c.get('userId');
+    const servers = await mcpList(userId);
+    return c.json({ servers });
+  });
+
+  app.post('/mcp/servers', async (c) => {
+    const userId = c.get('userId');
+    const body = await c.req.json().catch(() => null);
+    const err = validateMcpBody(body, { requireName: true, requireUrl: true });
+    if (err) return c.json({ error: err }, 400);
+    try {
+      const row = await mcpCreate(userId, {
+        name: body.name,
+        url: body.url,
+        allowed_tools: body.allowed_tools,
+        enabled: body.enabled,
+      });
+      return c.json({ server: row }, 201);
+    } catch (e) {
+      if (e instanceof McpNameTakenError) {
+        return c.json({ error: 'name already exists' }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.patch('/mcp/servers/:id', async (c) => {
+    const userId = c.get('userId');
+    const id = c.req.param('id');
+    const body = await c.req.json().catch(() => null);
+    const err = validateMcpBody(body, {});
+    if (err) return c.json({ error: err }, 400);
+    try {
+      const row = await mcpUpdate(id, userId, {
+        ...(body.name !== undefined && { name: body.name }),
+        ...(body.url !== undefined && { url: body.url }),
+        ...(body.allowed_tools !== undefined && {
+          allowed_tools: body.allowed_tools,
+        }),
+        ...(body.enabled !== undefined && { enabled: body.enabled }),
+      });
+      if (!row) return c.json({ error: 'not found' }, 404);
+      return c.json({ server: row });
+    } catch (e) {
+      if (e instanceof McpNameTakenError) {
+        return c.json({ error: 'name already exists' }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.delete('/mcp/servers/:id', async (c) => {
+    const userId = c.get('userId');
+    const id = c.req.param('id');
+    const ok = await mcpDelete(id, userId);
     if (!ok) return c.json({ error: 'not found' }, 404);
     return c.json({ ok: true });
   });
