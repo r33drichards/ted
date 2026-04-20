@@ -32,17 +32,18 @@ export async function POST(req: NextRequest) {
     return new Response('no user message', { status: 400 });
   }
 
-  // Open the SSE stream *before* we POST the message, so we don't miss early
-  // deltas. Ted's workflow coalesces messages, so the race is small, but
-  // ordering here keeps us safe.
+  // POST the message first — ted creates the session row on first /message,
+  // and the stream endpoint 404s until that row exists. Then open the SSE
+  // stream. There's a narrow race where the first deltas could land before
+  // we subscribe; Bedrock's ~1s time-to-first-token in practice makes it
+  // safe, and we could tighten further by replaying from stream id 0 if we
+  // see gaps — deferred.
   const abort = new AbortController();
+  await postMessage(userId, sessionId, last.content);
   const tedStream = await openStream(userId, sessionId, abort.signal);
   if (!tedStream.ok || !tedStream.body) {
     return new Response(`ted stream ${tedStream.status}`, { status: 502 });
   }
-
-  // Trigger generation.
-  await postMessage(userId, sessionId, last.content);
 
   const reader = tedStream.body.getReader();
   const decoder = new TextDecoder();

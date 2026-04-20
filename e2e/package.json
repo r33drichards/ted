@@ -1,0 +1,9 @@
+{
+  "name": "ted-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node login.test.mjs" },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
