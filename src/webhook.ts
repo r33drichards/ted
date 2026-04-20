@@ -4,7 +4,14 @@ import { serve } from '@hono/node-server';
 import { Client, Connection } from '@temporalio/client';
 import { chatSession } from './workflows.js';
 import { userMessageSignal } from './signals.js';
-import { ensureSchema, getMessages } from './db.js';
+import {
+  ensureSchema,
+  getMessages,
+  getSessions,
+  createSession,
+  sessionBelongsTo,
+  renameSession,
+} from './db.js';
 import { subscribeDeltas } from './publish.js';
 
 export type SignalWithStartFn = (
@@ -21,16 +28,39 @@ export type SignalWithStartFn = (
 export type AppDeps = {
   signalWithStart: SignalWithStartFn;
   taskQueue: string;
+  // Injectable DB helpers (tests override). Signatures mirror src/db.ts.
   getMessages?: typeof getMessages;
+  getSessions?: typeof getSessions;
+  createSession?: typeof createSession;
+  sessionBelongsTo?: typeof sessionBelongsTo;
+  renameSession?: typeof renameSession;
   subscribeDeltas?: typeof subscribeDeltas;
 };
 
+type Vars = { userId: string };
+
 export function makeApp(deps: AppDeps) {
-  const app = new Hono();
+  const app = new Hono<{ Variables: Vars }>();
   const readMessages = deps.getMessages ?? getMessages;
+  const readSessions = deps.getSessions ?? getSessions;
+  const recordSession = deps.createSession ?? createSession;
+  const ownsSession = deps.sessionBelongsTo ?? sessionBelongsTo;
+  const updateSessionTitle = deps.renameSession ?? renameSession;
   const subscribe = deps.subscribeDeltas ?? subscribeDeltas;
 
+  // Auth middleware: require X-User-ID. Ted trusts the Next.js BFF on
+  // localhost to set this header after verifying a Keycloak session.
+  app.use('*', async (c, next) => {
+    const userId = c.req.header('X-User-ID');
+    if (!userId) {
+      return c.json({ error: 'X-User-ID required' }, 401);
+    }
+    c.set('userId', userId);
+    await next();
+  });
+
   app.post('/message', async (c) => {
+    const userId = c.get('userId');
     const body = await c.req.json().catch(() => null);
     if (
       !body ||
@@ -42,10 +72,23 @@ export function makeApp(deps: AppDeps) {
       return c.json({ error: 'sessionId and msg required' }, 400);
     }
 
+    // If the session row already exists under a different user, reject.
+    const exists = await ownsSession(body.sessionId, userId);
+    if (!exists) {
+      // First message for this session — record ownership. If another user
+      // already owns this id, the INSERT is a no-op and the next ownsSession
+      // check fails.
+      await recordSession(userId, body.sessionId, null);
+      const nowOwned = await ownsSession(body.sessionId, userId);
+      if (!nowOwned) {
+        return c.json({ error: 'session belongs to another user' }, 403);
+      }
+    }
+
     const handle = await deps.signalWithStart(chatSession, {
       workflowId: `chat:${body.sessionId}`,
       taskQueue: deps.taskQueue,
-      args: [body.sessionId],
+      args: [body.sessionId, [], userId],
       signal: userMessageSignal,
       signalArgs: [body.msg],
     });
@@ -53,14 +96,40 @@ export function makeApp(deps: AppDeps) {
     return c.json({ ok: true, workflowId: handle.workflowId });
   });
 
+  app.get('/sessions', async (c) => {
+    const userId = c.get('userId');
+    const sessions = await readSessions(userId);
+    return c.json({ sessions });
+  });
+
   app.get('/sessions/:sessionId/messages', async (c) => {
+    const userId = c.get('userId');
     const sessionId = c.req.param('sessionId');
-    const messages = await readMessages(sessionId);
+    if (!(await ownsSession(sessionId, userId))) {
+      return c.json({ error: 'not found' }, 404);
+    }
+    const messages = await readMessages(sessionId, userId);
     return c.json({ sessionId, messages });
   });
 
-  app.get('/sessions/:sessionId/stream', (c) => {
+  app.patch('/sessions/:sessionId', async (c) => {
+    const userId = c.get('userId');
     const sessionId = c.req.param('sessionId');
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.title !== 'string') {
+      return c.json({ error: 'title required' }, 400);
+    }
+    const ok = await updateSessionTitle(sessionId, userId, body.title);
+    if (!ok) return c.json({ error: 'not found' }, 404);
+    return c.json({ ok: true });
+  });
+
+  app.get('/sessions/:sessionId/stream', async (c) => {
+    const userId = c.get('userId');
+    const sessionId = c.req.param('sessionId');
+    if (!(await ownsSession(sessionId, userId))) {
+      return c.json({ error: 'not found' }, 404);
+    }
     const lastEventId = c.req.header('Last-Event-ID');
     const fromQuery = c.req.query('from');
     const from = lastEventId ?? fromQuery ?? '$';

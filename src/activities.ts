@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
 import { heartbeat } from '@temporalio/activity';
 import { publishDelta, publishTurnEnd } from './publish.js';
-import { appendMessage } from './db.js';
+import { appendMessage, touchSession } from './db.js';
 import type { Role, StreamReq } from './types.js';
 
 // Bedrock when CLAUDE_CODE_USE_BEDROCK is set (any truthy value), else direct Anthropic API.
@@ -57,8 +57,10 @@ export type PersistTurnReq = {
   sessionId: string;
   role: Role;
   content: string;
+  userId: string;
 };
 
 export async function persistTurn(req: PersistTurnReq): Promise<void> {
-  await appendMessage(req.sessionId, req.role, req.content);
+  await appendMessage(req.sessionId, req.role, req.content, req.userId);
+  await touchSession(req.sessionId);
 }

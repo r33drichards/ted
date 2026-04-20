@@ -21,6 +21,7 @@ const HISTORY_LENGTH_LIMIT = 2000;
 export async function chatSession(
   sessionId: string,
   seedHistory: Msg[] = [],
+  userId: string = '',
 ): Promise<void> {
   const inbox: string[] = [];
   const history: Msg[] = [...seedHistory];
@@ -40,15 +41,15 @@ export async function chatSession(
 
     const userTurn = drainInbox(inbox, history);
     if (userTurn !== null) {
-      await persistTurn({ sessionId, role: 'user', content: userTurn });
+      await persistTurn({ sessionId, role: 'user', content: userTurn, userId });
     }
 
     const text = await streamClaude({ sessionId, history });
     history.push({ role: 'assistant', content: text });
-    await persistTurn({ sessionId, role: 'assistant', content: text });
+    await persistTurn({ sessionId, role: 'assistant', content: text, userId });
 
     if (workflowInfo().historyLength > HISTORY_LENGTH_LIMIT) {
-      await continueAsNew<typeof chatSession>(sessionId, history);
+      await continueAsNew<typeof chatSession>(sessionId, history, userId);
     }
   }
 }
