@@ -21,6 +21,7 @@ import {
 } from './db.js';
 import { subscribeDeltas } from './publish.js';
 import { closeSignal } from './signals.js';
+import * as mcp from './mcp-client.js';
 
 export type SignalWithStartFn = (
   workflow: typeof chatSession,
@@ -282,6 +283,30 @@ export function makeApp(deps: AppDeps) {
     const ok = await mcpDelete(id, userId);
     if (!ok) return c.json({ error: 'not found' }, 404);
     return c.json({ ok: true });
+  });
+
+  app.get('/mcp/servers/:id/health', async (c) => {
+    const userId = c.get('userId');
+    const id = c.req.param('id');
+    const rows = await mcpList(userId);
+    const row = rows.find((r) => r.id === id);
+    if (!row) return c.json({ error: 'not found' }, 404);
+    try {
+      const tools = await mcp.listTools(row.url);
+      return c.json({
+        connected: true,
+        tools: tools.map((t) => ({
+          name: t.name,
+          description: t.description ?? null,
+        })),
+      });
+    } catch (err) {
+      return c.json({
+        connected: false,
+        tools: [],
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 
   app.get('/sessions/:sessionId/stream', async (c) => {

@@ -1,7 +1,13 @@
 'use client';
-import { useState, useTransition } from 'react';
+import { useEffect, useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import type { McpServer } from '@/lib/ted';
+
+type HealthTool = { name: string; description: string | null };
+type Health =
+  | { status: 'loading' }
+  | { status: 'ok'; tools: HealthTool[] }
+  | { status: 'error'; message: string };
 
 type FormState = {
   name: string;
@@ -34,8 +40,47 @@ export default function McpServersClient({
   const [editId, setEditId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<FormState>(EMPTY);
   const [error, setError] = useState<string | null>(null);
+  const [health, setHealth] = useState<Record<string, Health>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [, startTransition] = useTransition();
   const router = useRouter();
+
+  async function checkHealth(id: string) {
+    setHealth((h) => ({ ...h, [id]: { status: 'loading' } }));
+    try {
+      const res = await fetch(
+        `/api/mcp/servers/${encodeURIComponent(id)}/health`,
+        { cache: 'no-store' },
+      );
+      const data = (await res.json()) as {
+        connected: boolean;
+        tools: HealthTool[];
+        error?: string;
+      };
+      setHealth((h) => ({
+        ...h,
+        [id]: data.connected
+          ? { status: 'ok', tools: data.tools }
+          : { status: 'error', message: data.error ?? 'failed' },
+      }));
+    } catch (err) {
+      setHealth((h) => ({
+        ...h,
+        [id]: {
+          status: 'error',
+          message: err instanceof Error ? err.message : 'failed',
+        },
+      }));
+    }
+  }
+
+  // Probe every enabled server once on mount and whenever the list changes.
+  useEffect(() => {
+    for (const s of servers) {
+      if (s.enabled && !health[s.id]) checkHealth(s.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers]);
 
   async function refresh() {
     const res = await fetch('/api/mcp/servers', { cache: 'no-store' });
@@ -111,6 +156,7 @@ export default function McpServersClient({
       return;
     }
     await refresh();
+    if (!s.enabled) checkHealth(s.id); // was disabled, now enabling — probe
   }
 
   function startEdit(s: McpServer) {
@@ -165,6 +211,15 @@ export default function McpServersClient({
                         disabled
                       </span>
                     )}
+                    <HealthBadge
+                      state={health[s.id] ?? { status: 'loading' }}
+                      onRefresh={() => checkHealth(s.id)}
+                      onToggle={() =>
+                        setExpanded((e) => ({ ...e, [s.id]: !e[s.id] }))
+                      }
+                      expanded={!!expanded[s.id]}
+                      enabled={s.enabled}
+                    />
                   </div>
                   <div className="truncate text-sm text-gray-600">{s.url}</div>
                   <div className="mt-1 text-xs text-gray-500">
@@ -172,6 +227,9 @@ export default function McpServersClient({
                       ? `tools: ${s.allowed_tools.join(', ')}`
                       : 'all tools allowed'}
                   </div>
+                  {expanded[s.id] && (
+                    <ToolList state={health[s.id] ?? { status: 'loading' }} />
+                  )}
                 </div>
                 <div className="flex shrink-0 gap-2">
                   <button
@@ -282,6 +340,88 @@ function EditFields({
         Enabled
       </label>
     </div>
+  );
+}
+
+function HealthBadge({
+  state,
+  onRefresh,
+  onToggle,
+  expanded,
+  enabled,
+}: {
+  state: Health;
+  onRefresh: () => void;
+  onToggle: () => void;
+  expanded: boolean;
+  enabled: boolean;
+}) {
+  if (!enabled) {
+    return (
+      <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400">
+        not probed
+      </span>
+    );
+  }
+  if (state.status === 'loading') {
+    return (
+      <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400">
+        probing…
+      </span>
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <button
+        type="button"
+        onClick={onRefresh}
+        title={state.message}
+        className="rounded bg-red-900/50 px-2 py-0.5 text-xs text-red-300 hover:bg-red-900"
+      >
+        disconnected
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="rounded bg-emerald-900/50 px-2 py-0.5 text-xs text-emerald-300 hover:bg-emerald-900"
+    >
+      connected · {state.tools.length} tool
+      {state.tools.length === 1 ? '' : 's'}
+      {expanded ? ' ▲' : ' ▼'}
+    </button>
+  );
+}
+
+function ToolList({ state }: { state: Health }) {
+  if (state.status === 'loading')
+    return <div className="mt-2 text-xs text-zinc-500">loading tools…</div>;
+  if (state.status === 'error')
+    return (
+      <div className="mt-2 rounded bg-red-900/30 p-2 text-xs text-red-300">
+        {state.message}
+      </div>
+    );
+  if (state.tools.length === 0)
+    return (
+      <div className="mt-2 text-xs text-zinc-500">server exposes no tools</div>
+    );
+  return (
+    <ul className="mt-2 space-y-1 text-xs">
+      {state.tools.map((t) => (
+        <li
+          key={t.name}
+          className="rounded bg-zinc-800/60 px-2 py-1 text-zinc-300"
+        >
+          <code className="font-mono text-emerald-300">{t.name}</code>
+          {t.description && (
+            <span className="ml-2 text-zinc-400">{t.description}</span>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
 
