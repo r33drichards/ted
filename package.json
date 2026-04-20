@@ -1,0 +1,30 @@
+{
+  "name": "claude-temporal-chat",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p .",
+    "worker": "node --loader ts-node/esm src/worker.ts",
+    "webhook": "node --loader ts-node/esm src/webhook.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "@hono/node-server": "^1.13.0",
+    "@temporalio/activity": "^1.11.0",
+    "@temporalio/client": "^1.11.0",
+    "@temporalio/worker": "^1.11.0",
+    "@temporalio/workflow": "^1.11.0",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@temporalio/testing": "^1.11.0",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
