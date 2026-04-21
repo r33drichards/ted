@@ -18,10 +18,21 @@ import {
   updateMcpServer,
   deleteMcpServer,
   McpNameTakenError,
+  listScheduledPrompts,
+  createScheduledPrompt,
+  updateScheduledPrompt,
+  deleteScheduledPrompt,
+  getScheduledPrompt,
+  ScheduledPromptNameTakenError,
 } from './db.js';
 import { subscribeDeltas } from './publish.js';
 import { closeSignal } from './signals.js';
 import * as mcp from './mcp-client.js';
+import {
+  upsertSchedule,
+  deleteSchedule as deleteScheduleHandle,
+  pauseSchedule,
+} from './scheduled-prompts.js';
 
 export type SignalWithStartFn = (
   workflow: typeof chatSession,
@@ -35,6 +46,19 @@ export type SignalWithStartFn = (
 ) => Promise<{ workflowId: string }>;
 
 export type SignalCloseFn = (workflowId: string) => Promise<void>;
+
+export type ScheduleSyncFns = {
+  upsert: (input: {
+    promptId: string;
+    userId: string;
+    sessionId: string;
+    prompt: string;
+    intervalSeconds: number;
+    enabled: boolean;
+  }) => Promise<void>;
+  pause: (promptId: string, paused: boolean) => Promise<void>;
+  remove: (promptId: string) => Promise<void>;
+};
 
 export type AppDeps = {
   signalWithStart: SignalWithStartFn;
@@ -52,6 +76,12 @@ export type AppDeps = {
   createMcpServer?: typeof createMcpServer;
   updateMcpServer?: typeof updateMcpServer;
   deleteMcpServer?: typeof deleteMcpServer;
+  listScheduledPrompts?: typeof listScheduledPrompts;
+  createScheduledPrompt?: typeof createScheduledPrompt;
+  updateScheduledPrompt?: typeof updateScheduledPrompt;
+  deleteScheduledPrompt?: typeof deleteScheduledPrompt;
+  getScheduledPrompt?: typeof getScheduledPrompt;
+  scheduleSync?: ScheduleSyncFns;
   // Close the running workflow for this session. Best-effort — if the
   // workflow isn't running this is a no-op.
   signalClose?: SignalCloseFn;
@@ -60,6 +90,61 @@ export type AppDeps = {
 type Vars = { userId: string };
 
 type McpValidateOpts = { requireName?: boolean; requireUrl?: boolean };
+
+type SpValidateOpts = {
+  requireName?: boolean;
+  requirePrompt?: boolean;
+  requireSessionId?: boolean;
+  requireIntervalSeconds?: boolean;
+};
+
+const MIN_INTERVAL_SECONDS = 60;
+const MAX_INTERVAL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+
+function validateScheduledPromptBody(
+  body: unknown,
+  opts: SpValidateOpts,
+): string | null {
+  if (!body || typeof body !== 'object') return 'invalid body';
+  const b = body as Record<string, unknown>;
+  if (opts.requireName && typeof b.name !== 'string') return 'name required';
+  if (b.name !== undefined) {
+    if (typeof b.name !== 'string' || !b.name || b.name.length > 128) {
+      return 'name must be a non-empty string up to 128 chars';
+    }
+  }
+  if (opts.requirePrompt && typeof b.prompt !== 'string') return 'prompt required';
+  if (b.prompt !== undefined) {
+    if (typeof b.prompt !== 'string' || !b.prompt || b.prompt.length > 8000) {
+      return 'prompt must be a non-empty string up to 8000 chars';
+    }
+  }
+  if (opts.requireSessionId && typeof b.session_id !== 'string') {
+    return 'session_id required';
+  }
+  if (b.session_id !== undefined) {
+    if (typeof b.session_id !== 'string' || !b.session_id) {
+      return 'session_id must be a non-empty string';
+    }
+  }
+  if (opts.requireIntervalSeconds && typeof b.interval_seconds !== 'number') {
+    return 'interval_seconds required';
+  }
+  if (b.interval_seconds !== undefined) {
+    if (
+      typeof b.interval_seconds !== 'number' ||
+      !Number.isInteger(b.interval_seconds) ||
+      b.interval_seconds < MIN_INTERVAL_SECONDS ||
+      b.interval_seconds > MAX_INTERVAL_SECONDS
+    ) {
+      return `interval_seconds must be an integer between ${MIN_INTERVAL_SECONDS} and ${MAX_INTERVAL_SECONDS}`;
+    }
+  }
+  if (b.enabled !== undefined && typeof b.enabled !== 'boolean') {
+    return 'enabled must be a boolean';
+  }
+  return null;
+}
 
 function validateMcpBody(body: unknown, opts: McpValidateOpts): string | null {
   if (!body || typeof body !== 'object') return 'invalid body';
@@ -113,6 +198,16 @@ export function makeApp(deps: AppDeps) {
   const mcpCreate = deps.createMcpServer ?? createMcpServer;
   const mcpUpdate = deps.updateMcpServer ?? updateMcpServer;
   const mcpDelete = deps.deleteMcpServer ?? deleteMcpServer;
+  const spList = deps.listScheduledPrompts ?? listScheduledPrompts;
+  const spCreate = deps.createScheduledPrompt ?? createScheduledPrompt;
+  const spUpdate = deps.updateScheduledPrompt ?? updateScheduledPrompt;
+  const spDelete = deps.deleteScheduledPrompt ?? deleteScheduledPrompt;
+  const spGet = deps.getScheduledPrompt ?? getScheduledPrompt;
+  const scheduleSync: ScheduleSyncFns = deps.scheduleSync ?? {
+    upsert: async () => undefined,
+    pause: async () => undefined,
+    remove: async () => undefined,
+  };
 
   // Auth middleware: require X-User-ID. Ted trusts the Next.js BFF on
   // localhost to set this header after verifying a Keycloak session.
@@ -309,6 +404,127 @@ export function makeApp(deps: AppDeps) {
     }
   });
 
+  app.get('/scheduled-prompts', async (c) => {
+    const userId = c.get('userId');
+    const prompts = await spList(userId);
+    return c.json({ prompts });
+  });
+
+  app.post('/scheduled-prompts', async (c) => {
+    const userId = c.get('userId');
+    const body = await c.req.json().catch(() => null);
+    const err = validateScheduledPromptBody(body, {
+      requireName: true,
+      requirePrompt: true,
+      requireSessionId: true,
+      requireIntervalSeconds: true,
+    });
+    if (err) return c.json({ error: err }, 400);
+    const b = body as {
+      name: string;
+      prompt: string;
+      session_id: string;
+      interval_seconds: number;
+      enabled?: boolean;
+    };
+    if (!(await ownsSession(b.session_id, userId))) {
+      return c.json({ error: 'session not found' }, 404);
+    }
+    try {
+      const row = await spCreate(userId, {
+        name: b.name,
+        prompt: b.prompt,
+        session_id: b.session_id,
+        interval_seconds: b.interval_seconds,
+        enabled: b.enabled,
+      });
+      try {
+        await scheduleSync.upsert({
+          promptId: row.id,
+          userId,
+          sessionId: row.session_id,
+          prompt: row.prompt,
+          intervalSeconds: row.interval_seconds,
+          enabled: row.enabled,
+        });
+      } catch (e) {
+        await spDelete(row.id, userId);
+        throw e;
+      }
+      return c.json({ prompt: row }, 201);
+    } catch (e) {
+      if (e instanceof ScheduledPromptNameTakenError) {
+        return c.json({ error: 'name already exists' }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.patch('/scheduled-prompts/:id', async (c) => {
+    const userId = c.get('userId');
+    const id = c.req.param('id');
+    const body = await c.req.json().catch(() => null);
+    const err = validateScheduledPromptBody(body, {});
+    if (err) return c.json({ error: err }, 400);
+    const b = body as {
+      name?: string;
+      prompt?: string;
+      session_id?: string;
+      interval_seconds?: number;
+      enabled?: boolean;
+    };
+    if (b.session_id !== undefined && !(await ownsSession(b.session_id, userId))) {
+      return c.json({ error: 'session not found' }, 404);
+    }
+    try {
+      const row = await spUpdate(id, userId, {
+        ...(b.name !== undefined && { name: b.name }),
+        ...(b.prompt !== undefined && { prompt: b.prompt }),
+        ...(b.session_id !== undefined && { session_id: b.session_id }),
+        ...(b.interval_seconds !== undefined && {
+          interval_seconds: b.interval_seconds,
+        }),
+        ...(b.enabled !== undefined && { enabled: b.enabled }),
+      });
+      if (!row) return c.json({ error: 'not found' }, 404);
+      // Keep Temporal Schedule in sync with the DB row.
+      const onlyToggledEnabled =
+        b.enabled !== undefined &&
+        b.prompt === undefined &&
+        b.session_id === undefined &&
+        b.interval_seconds === undefined &&
+        b.name === undefined;
+      if (onlyToggledEnabled) {
+        await scheduleSync.pause(row.id, !row.enabled);
+      } else {
+        await scheduleSync.upsert({
+          promptId: row.id,
+          userId,
+          sessionId: row.session_id,
+          prompt: row.prompt,
+          intervalSeconds: row.interval_seconds,
+          enabled: row.enabled,
+        });
+      }
+      return c.json({ prompt: row });
+    } catch (e) {
+      if (e instanceof ScheduledPromptNameTakenError) {
+        return c.json({ error: 'name already exists' }, 409);
+      }
+      throw e;
+    }
+  });
+
+  app.delete('/scheduled-prompts/:id', async (c) => {
+    const userId = c.get('userId');
+    const id = c.req.param('id');
+    const row = await spGet(id, userId);
+    if (!row) return c.json({ error: 'not found' }, 404);
+    await scheduleSync.remove(id);
+    await spDelete(id, userId);
+    return c.json({ ok: true });
+  });
+
   app.get('/sessions/:sessionId/stream', async (c) => {
     const userId = c.get('userId');
     const sessionId = c.req.param('sessionId');
@@ -363,6 +579,20 @@ async function main() {
       } catch {
         /* workflow may be absent or already done; best-effort */
       }
+    },
+    scheduleSync: {
+      upsert: (input) =>
+        upsertSchedule(client, {
+          promptId: input.promptId,
+          userId: input.userId,
+          sessionId: input.sessionId,
+          prompt: input.prompt,
+          intervalSeconds: input.intervalSeconds,
+          enabled: input.enabled,
+          taskQueue,
+        }),
+      pause: (promptId, paused) => pauseSchedule(client, promptId, paused),
+      remove: (promptId) => deleteScheduleHandle(client, promptId),
     },
   });
 

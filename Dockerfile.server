@@ -1,0 +1,22 @@
+FROM node:20-slim
+
+WORKDIR /app
+
+# @temporalio/core-bridge is a native Rust module built only for glibc
+# targets (x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu). Don't
+# switch this base to -alpine — the worker will fail to dlopen
+# ld-linux-*.so.2 at startup.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+
+EXPOSE 8787
+
+# Overridden by compose: "worker" or "webhook".
+CMD ["node", "--loader", "ts-node/esm", "src/webhook.ts"]

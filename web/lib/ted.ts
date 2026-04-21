@@ -149,6 +149,38 @@ export async function deleteMcpServer(userId: string, id: string): Promise<void>
   if (!res.ok) throw new Error(`ted DELETE /mcp/servers ${res.status}`);
 }
 
+export type ScheduledPrompt = {
+  id: string;
+  user_id: string;
+  name: string;
+  prompt: string;
+  session_id: string;
+  interval_seconds: number;
+  enabled: boolean;
+  last_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ScheduledPromptInput = {
+  name: string;
+  prompt: string;
+  session_id: string;
+  interval_seconds: number;
+  enabled?: boolean;
+};
+
+export type ScheduledPromptPatch = Partial<ScheduledPromptInput>;
+
+export async function listScheduledPrompts(
+  userId: string,
+): Promise<ScheduledPrompt[]> {
+  const res = await tedFetch(userId, '/scheduled-prompts');
+  if (!res.ok) throw new Error(`ted /scheduled-prompts ${res.status}`);
+  const data = (await res.json()) as { prompts: ScheduledPrompt[] };
+  return data.prompts;
+}
+
 /**
  * Open ted's SSE stream for a session. Returns the response so the caller
  * can pipe the body through to the browser.

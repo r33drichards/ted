@@ -11,6 +11,10 @@ import {
 } from './db.js';
 import * as mcp from './mcp-client.js';
 import type { Role, StreamReq } from './types.js';
+import {
+  deliverScheduledPrompt as _deliverScheduledPrompt,
+  type ScheduledPromptTickInput,
+} from './scheduled-prompts.js';
 
 // Bedrock when CLAUDE_CODE_USE_BEDROCK is set (any truthy value), else direct Anthropic API.
 const useBedrock = !!process.env.CLAUDE_CODE_USE_BEDROCK;
@@ -259,6 +263,37 @@ export type GenerateTitleReq = {
  * and save it on the sessions row. Failures are swallowed; the sidebar
  * falls back to the session id prefix until something succeeds.
  */
+type DeliverDeps = {
+  signalWithStart: (args: {
+    workflowId: string;
+    taskQueue: string;
+    userId: string;
+    sessionId: string;
+    prompt: string;
+  }) => Promise<void>;
+  taskQueue: string;
+};
+
+let deliverDeps: DeliverDeps | null = null;
+
+/**
+ * Install the Temporal client plumbing used by the `deliverScheduledPrompt`
+ * activity. Worker startup calls this before `Worker.create`, so that the
+ * activity can signal-with-start a chat session when a schedule fires.
+ */
+export function initDeliverScheduledPrompt(deps: DeliverDeps): void {
+  deliverDeps = deps;
+}
+
+export async function deliverScheduledPrompt(
+  input: ScheduledPromptTickInput,
+): Promise<void> {
+  if (!deliverDeps) {
+    throw new Error('deliverScheduledPrompt called before initDeliverScheduledPrompt');
+  }
+  await _deliverScheduledPrompt(input, deliverDeps);
+}
+
 export async function generateTitle(req: GenerateTitleReq): Promise<void> {
   try {
     const resp = (await (

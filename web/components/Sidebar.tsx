@@ -131,12 +131,22 @@ export default function Sidebar() {
         <Link
           href="/settings/mcp"
           className={`block rounded-md px-3 py-2 text-sm ${
-            pathname.startsWith('/settings')
+            pathname === '/settings/mcp'
               ? 'bg-zinc-800 text-white'
               : 'text-zinc-400 hover:bg-zinc-800'
           }`}
         >
-          Settings
+          MCP servers
+        </Link>
+        <Link
+          href="/settings/scheduled"
+          className={`block rounded-md px-3 py-2 text-sm ${
+            pathname === '/settings/scheduled'
+              ? 'bg-zinc-800 text-white'
+              : 'text-zinc-400 hover:bg-zinc-800'
+          }`}
+        >
+          Scheduled prompts
         </Link>
         <form action="/api/auth/signout" method="post">
           <button
