@@ -1,5 +1,8 @@
 import { Worker, NativeConnection } from '@temporalio/worker';
+import { Client, Connection } from '@temporalio/client';
 import * as activities from './activities.js';
+import { chatSession } from './workflows.js';
+import { userMessageSignal } from './signals.js';
 import { ensureSchema } from './db.js';
 
 async function main() {
@@ -10,6 +13,21 @@ async function main() {
   await ensureSchema();
 
   const connection = await NativeConnection.connect({ address });
+  const clientConnection = await Connection.connect({ address });
+  const client = new Client({ connection: clientConnection, namespace });
+
+  activities.initDeliverScheduledPrompt({
+    taskQueue,
+    signalWithStart: async ({ workflowId, taskQueue, sessionId, userId, prompt }) => {
+      await client.workflow.signalWithStart(chatSession, {
+        workflowId,
+        taskQueue,
+        args: [sessionId, [], userId],
+        signal: userMessageSignal,
+        signalArgs: [prompt],
+      });
+    },
+  });
 
   const worker = await Worker.create({
     connection,

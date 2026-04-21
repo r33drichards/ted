@@ -51,6 +51,22 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 );
 CREATE INDEX IF NOT EXISTS mcp_servers_user_enabled_idx
   ON mcp_servers (user_id) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS scheduled_prompts (
+  id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           TEXT        NOT NULL,
+  name              TEXT        NOT NULL,
+  prompt            TEXT        NOT NULL,
+  session_id        TEXT        NOT NULL,
+  interval_seconds  INTEGER     NOT NULL CHECK (interval_seconds >= 60),
+  enabled           BOOLEAN     NOT NULL DEFAULT true,
+  last_run_at       TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, name)
+);
+CREATE INDEX IF NOT EXISTS scheduled_prompts_user_idx
+  ON scheduled_prompts (user_id, created_at DESC);
 `;
 
 export async function ensureSchema(): Promise<void> {
@@ -358,6 +374,168 @@ export async function deleteMcpServer(
 ): Promise<boolean> {
   const res = await getPool().query(
     'DELETE FROM mcp_servers WHERE id = $1 AND user_id = $2',
+    [id, userId],
+  );
+  return (res.rowCount ?? 0) > 0;
+}
+
+export type ScheduledPromptRow = {
+  id: string;
+  user_id: string;
+  name: string;
+  prompt: string;
+  session_id: string;
+  interval_seconds: number;
+  enabled: boolean;
+  last_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export class ScheduledPromptNameTakenError extends Error {
+  constructor(name: string) {
+    super(`scheduled prompt name already exists: ${name}`);
+    this.name = 'ScheduledPromptNameTakenError';
+  }
+}
+
+const SCHEDULED_PROMPT_COLS =
+  'id, user_id, name, prompt, session_id, interval_seconds, enabled, last_run_at, created_at, updated_at';
+
+export async function listScheduledPrompts(
+  userId: string,
+): Promise<ScheduledPromptRow[]> {
+  const { rows } = await getPool().query<ScheduledPromptRow>(
+    `SELECT ${SCHEDULED_PROMPT_COLS} FROM scheduled_prompts
+      WHERE user_id = $1
+      ORDER BY created_at DESC`,
+    [userId],
+  );
+  return rows;
+}
+
+export async function getScheduledPrompt(
+  id: string,
+  userId: string,
+): Promise<ScheduledPromptRow | null> {
+  const { rows } = await getPool().query<ScheduledPromptRow>(
+    `SELECT ${SCHEDULED_PROMPT_COLS} FROM scheduled_prompts
+      WHERE id = $1 AND user_id = $2`,
+    [id, userId],
+  );
+  return rows[0] ?? null;
+}
+
+export type CreateScheduledPromptInput = {
+  name: string;
+  prompt: string;
+  session_id: string;
+  interval_seconds: number;
+  enabled?: boolean;
+};
+
+export async function createScheduledPrompt(
+  userId: string,
+  input: CreateScheduledPromptInput,
+): Promise<ScheduledPromptRow> {
+  try {
+    const { rows } = await getPool().query<ScheduledPromptRow>(
+      `INSERT INTO scheduled_prompts
+         (user_id, name, prompt, session_id, interval_seconds, enabled)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING ${SCHEDULED_PROMPT_COLS}`,
+      [
+        userId,
+        input.name,
+        input.prompt,
+        input.session_id,
+        input.interval_seconds,
+        input.enabled ?? true,
+      ],
+    );
+    return rows[0]!;
+  } catch (err) {
+    if ((err as { code?: string }).code === '23505') {
+      throw new ScheduledPromptNameTakenError(input.name);
+    }
+    throw err;
+  }
+}
+
+export type UpdateScheduledPromptPatch = Partial<{
+  name: string;
+  prompt: string;
+  session_id: string;
+  interval_seconds: number;
+  enabled: boolean;
+}>;
+
+export async function updateScheduledPrompt(
+  id: string,
+  userId: string,
+  patch: UpdateScheduledPromptPatch,
+): Promise<ScheduledPromptRow | null> {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  if (patch.name !== undefined) {
+    params.push(patch.name);
+    sets.push(`name = $${params.length}`);
+  }
+  if (patch.prompt !== undefined) {
+    params.push(patch.prompt);
+    sets.push(`prompt = $${params.length}`);
+  }
+  if (patch.session_id !== undefined) {
+    params.push(patch.session_id);
+    sets.push(`session_id = $${params.length}`);
+  }
+  if (patch.interval_seconds !== undefined) {
+    params.push(patch.interval_seconds);
+    sets.push(`interval_seconds = $${params.length}`);
+  }
+  if (patch.enabled !== undefined) {
+    params.push(patch.enabled);
+    sets.push(`enabled = $${params.length}`);
+  }
+  if (sets.length === 0) {
+    return getScheduledPrompt(id, userId);
+  }
+  sets.push(`updated_at = now()`);
+  params.push(id, userId);
+  const idIdx = params.length - 1;
+  const userIdx = params.length;
+  try {
+    const { rows } = await getPool().query<ScheduledPromptRow>(
+      `UPDATE scheduled_prompts SET ${sets.join(', ')}
+        WHERE id = $${idIdx} AND user_id = $${userIdx}
+        RETURNING ${SCHEDULED_PROMPT_COLS}`,
+      params,
+    );
+    return rows[0] ?? null;
+  } catch (err) {
+    if ((err as { code?: string }).code === '23505') {
+      throw new ScheduledPromptNameTakenError(patch.name ?? '');
+    }
+    throw err;
+  }
+}
+
+export async function markScheduledPromptRan(
+  id: string,
+  userId: string,
+): Promise<void> {
+  await getPool().query(
+    'UPDATE scheduled_prompts SET last_run_at = now() WHERE id = $1 AND user_id = $2',
+    [id, userId],
+  );
+}
+
+export async function deleteScheduledPrompt(
+  id: string,
+  userId: string,
+): Promise<boolean> {
+  const res = await getPool().query(
+    'DELETE FROM scheduled_prompts WHERE id = $1 AND user_id = $2',
     [id, userId],
   );
   return (res.rowCount ?? 0) > 0;

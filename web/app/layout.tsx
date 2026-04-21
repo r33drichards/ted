@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import '@cloudscape-design/global-styles/index.css';
 import './globals.css';
 
 export const metadata: Metadata = {

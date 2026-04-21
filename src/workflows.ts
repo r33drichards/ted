@@ -18,6 +18,11 @@ const { streamClaude, persistTurn, generateTitle } = proxyActivities<
   retry: { maximumAttempts: 3 },
 });
 
+const { deliverScheduledPrompt } = proxyActivities<typeof activities>({
+  startToCloseTimeout: '1 minute',
+  retry: { maximumAttempts: 3 },
+});
+
 const HISTORY_LENGTH_LIMIT = 2000;
 
 export async function chatSession(
@@ -62,4 +67,22 @@ export async function chatSession(
       await continueAsNew<typeof chatSession>(sessionId, history, userId);
     }
   }
+}
+
+export type ScheduledPromptTickArgs = {
+  promptId: string;
+  userId: string;
+  sessionId: string;
+  prompt: string;
+};
+
+/**
+ * Tick workflow launched by a Temporal Schedule. Single-shot: just hands
+ * off to the `deliverScheduledPrompt` activity which signals the chat
+ * session. Keeps the Schedule → Workflow → Activity chain idiomatic.
+ */
+export async function scheduledPromptTick(
+  args: ScheduledPromptTickArgs,
+): Promise<void> {
+  await deliverScheduledPrompt(args);
 }
