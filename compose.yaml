@@ -80,7 +80,6 @@ services:
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
     volumes:
       - ./docker/keycloak/realms.json:/opt/keycloak/data/import/realms.json:ro
-      - keycloak_data:/opt/keycloak/data/h2
     ports:
       - "8080:8080"
     healthcheck:
@@ -179,4 +178,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  keycloak_data:
