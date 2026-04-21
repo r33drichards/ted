@@ -1,0 +1,182 @@
+name: ted
+
+# Local dev stack. See docker/README or the top-level README for the
+# one-time /etc/hosts entry required so `keycloak:8080` resolves on the
+# host machine the same way it does inside this network.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ted
+      POSTGRES_PASSWORD: ted
+      POSTGRES_DB: ted
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ted -d ted"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.28
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ted
+      POSTGRES_PWD: ted
+      POSTGRES_SEEDS: postgres
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+    ports:
+      - "7233:7233"
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  temporal-ui:
+    image: temporalio/ui:2.33.0
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8233:8080"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
+    volumes:
+      - ./docker/keycloak/realms.json:/opt/keycloak/data/import/realms.json:ro
+      - keycloak_data:/opt/keycloak/data/h2
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # Keycloak's /health uses the management port 9000 by default; 8080
+      # returns 200 on /realms/master once the realm import completes.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/ted/.well-known/openid-configuration HTTP/1.1\\r\\nHost: keycloak\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TASK_QUEUE: chat
+      DATABASE_URL: postgres://ted:ted@postgres:5432/chat
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-4-5}
+    volumes:
+      - ./src:/app/src:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+    command: ["node", "--loader", "ts-node/esm", "src/worker.ts"]
+
+  webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TASK_QUEUE: chat
+      WEBHOOK_PORT: "8787"
+      DATABASE_URL: postgres://ted:ted@postgres:5432/chat
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-4-5}
+    volumes:
+      - ./src:/app/src:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+    ports:
+      - "8787:8787"
+    command: ["node", "--loader", "ts-node/esm", "src/webhook.ts"]
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    depends_on:
+      webhook:
+        condition: service_started
+      keycloak:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+      TED_URL: http://webhook:8787
+      AUTH_URL: http://localhost:3000
+      AUTH_TRUST_HOST: "true"
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-local-dev-secret-change-me}
+      AUTH_KEYCLOAK_ISSUER: http://keycloak:8080/realms/ted
+      AUTH_KEYCLOAK_ID: ted-web
+      AUTH_KEYCLOAK_SECRET: ted-dev-secret
+    volumes:
+      - ./web/app:/app/app
+      - ./web/components:/app/components
+      - ./web/lib:/app/lib
+      - ./web/middleware.ts:/app/middleware.ts
+      - ./web/next.config.mjs:/app/next.config.mjs
+      - ./web/tailwind.config.ts:/app/tailwind.config.ts
+      - ./web/postcss.config.mjs:/app/postcss.config.mjs
+      - ./web/tsconfig.json:/app/tsconfig.json
+      - ./web/next-env.d.ts:/app/next-env.d.ts
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  redis_data:
+  keycloak_data:

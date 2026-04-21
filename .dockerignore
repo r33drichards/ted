@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.next
+.env
+.env.*
+!.env.example
+*.log
+.git
+.github
+e2e
+web
+docker
+.claude

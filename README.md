@@ -11,7 +11,59 @@ Durable Claude chat sessions over Temporal. One workflow per session, webhook fo
 - `ANTHROPIC_API_KEY` set
 - Optional: `REDIS_URL` (default `redis://localhost:6379`), `DATABASE_URL` (default `postgres://localhost:5432/chat`)
 
-## Run locally
+## Run locally with Docker Compose
+
+The full stack (Postgres, Redis, Temporal + UI, Keycloak, worker, webhook, web) boots from a single compose file.
+
+1. **One-time `/etc/hosts`**:
+
+   The web app and the browser must reach Keycloak at the *same* URL, so the issuer the server sees matches the URL the browser follows. Add this line:
+
+   ```
+   127.0.0.1 keycloak
+   ```
+
+2. **`.env`**:
+
+   ```bash
+   cp .env.example .env
+   # edit and set ANTHROPIC_API_KEY=sk-ant-...
+   ```
+
+3. **Up**:
+
+   ```bash
+   docker compose up --build
+   ```
+
+4. Open <http://localhost:3000>. Sign in with **`demo` / `demo`** (pre-seeded in `docker/keycloak/realms.json`).
+
+### What runs where
+
+| Service        | URL                               | Notes                                              |
+| -------------- | --------------------------------- | -------------------------------------------------- |
+| Web UI         | http://localhost:3000             | Next.js (dev mode, hot reload)                     |
+| Webhook (Hono) | http://localhost:8787             | `/message`, `/sessions/*`, `/scheduled-prompts/*`  |
+| Temporal UI    | http://localhost:8233             | Workflow inspection                                |
+| Temporal gRPC  | localhost:7233                    | SDK connection                                     |
+| Keycloak       | http://keycloak:8080              | Admin: `admin` / `admin` at `/admin`               |
+| Postgres       | localhost:5432                    | User `ted` / pwd `ted`, DBs: `chat`, `temporal*`   |
+| Redis          | localhost:6379                    | Streams fan-out                                    |
+
+### Dev loop
+
+`./src/**` and `./web/{app,components,lib,…}` are bind-mounted. Changes:
+
+- **Web**: Next.js picks them up automatically (Fast Refresh).
+- **Worker / webhook**: restart the container (`docker compose restart worker webhook`) — ts-node doesn't watch.
+
+### Reset
+
+```bash
+docker compose down -v   # wipes postgres, keycloak, redis volumes
+```
+
+## Run locally (without Docker)
 
 Three terminals:
 
