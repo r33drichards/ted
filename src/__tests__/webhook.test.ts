@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
 import { makeApp } from '../webhook.js';
-import { McpNameTakenError } from '../db.js';
 import type { Msg } from '../types.js';
 
 const USER = 'user-alice';
@@ -56,7 +55,7 @@ describe('webhook /message', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(createSession).toHaveBeenCalledWith(USER, 'abc', null, null);
+    expect(createSession).toHaveBeenCalledWith(USER, 'abc');
     expect(signalWithStart).toHaveBeenCalledTimes(1);
     const call = signalWithStart.mock.calls[0];
     expect(call[1]).toMatchObject({
@@ -69,7 +68,7 @@ describe('webhook /message', () => {
 
   it('returns 403 when session already belongs to a different user', async () => {
     const signalWithStart = vi.fn();
-    const sessionBelongsTo = vi.fn().mockResolvedValue(false); // both checks false
+    const sessionBelongsTo = vi.fn().mockResolvedValue(false);
     const createSession = vi.fn().mockResolvedValue(undefined);
 
     const app = makeApp({
@@ -246,166 +245,6 @@ describe('webhook DELETE /sessions/:id', () => {
     });
     expect(res.status).toBe(200);
     expect(deleteSession).toHaveBeenCalled();
-  });
-});
-
-describe('webhook /mcp/servers', () => {
-  const row = {
-    id: 'srv-1',
-    user_id: USER,
-    name: 'github',
-    url: 'https://example.com/mcp',
-    allowed_tools: ['create_issue'],
-    enabled: true,
-    created_at: '2026-04-20T00:00:00Z',
-    updated_at: '2026-04-20T00:00:00Z',
-  };
-
-  it('GET lists caller\'s servers', async () => {
-    const listMcpServers = vi.fn().mockResolvedValue([row]);
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      listMcpServers,
-    });
-    const res = await app.request('/mcp/servers', { headers: AUTH });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ servers: [row] });
-    expect(listMcpServers).toHaveBeenCalledWith(USER);
-  });
-
-  it('POST creates a server', async () => {
-    const createMcpServer = vi.fn().mockResolvedValue(row);
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      createMcpServer,
-    });
-    const res = await app.request('/mcp/servers', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...AUTH },
-      body: JSON.stringify({
-        name: 'github',
-        url: 'https://example.com/mcp',
-        allowed_tools: ['create_issue'],
-      }),
-    });
-    expect(res.status).toBe(201);
-    expect(createMcpServer).toHaveBeenCalledWith(USER, {
-      name: 'github',
-      url: 'https://example.com/mcp',
-      allowed_tools: ['create_issue'],
-      enabled: undefined,
-    });
-  });
-
-  it('POST returns 400 on invalid url', async () => {
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      createMcpServer: vi.fn(),
-    });
-    const res = await app.request('/mcp/servers', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...AUTH },
-      body: JSON.stringify({ name: 'x', url: 'not-a-url' }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST returns 400 when name missing', async () => {
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      createMcpServer: vi.fn(),
-    });
-    const res = await app.request('/mcp/servers', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...AUTH },
-      body: JSON.stringify({ url: 'https://example.com/mcp' }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST returns 409 on duplicate name', async () => {
-    const createMcpServer = vi
-      .fn()
-      .mockRejectedValue(new McpNameTakenError('github'));
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      createMcpServer,
-    });
-    const res = await app.request('/mcp/servers', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...AUTH },
-      body: JSON.stringify({ name: 'github', url: 'https://example.com/mcp' }),
-    });
-    expect(res.status).toBe(409);
-  });
-
-  it('PATCH updates when owned', async () => {
-    const updateMcpServer = vi
-      .fn()
-      .mockResolvedValue({ ...row, enabled: false });
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      updateMcpServer,
-    });
-    const res = await app.request('/mcp/servers/srv-1', {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json', ...AUTH },
-      body: JSON.stringify({ enabled: false }),
-    });
-    expect(res.status).toBe(200);
-    expect(updateMcpServer).toHaveBeenCalledWith('srv-1', USER, {
-      enabled: false,
-    });
-  });
-
-  it('PATCH returns 404 when row not owned', async () => {
-    const updateMcpServer = vi.fn().mockResolvedValue(null);
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      updateMcpServer,
-    });
-    const res = await app.request('/mcp/servers/other', {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json', ...AUTH },
-      body: JSON.stringify({ enabled: true }),
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it('DELETE removes when owned', async () => {
-    const deleteMcpServer = vi.fn().mockResolvedValue(true);
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      deleteMcpServer,
-    });
-    const res = await app.request('/mcp/servers/srv-1', {
-      method: 'DELETE',
-      headers: AUTH,
-    });
-    expect(res.status).toBe(200);
-    expect(deleteMcpServer).toHaveBeenCalledWith('srv-1', USER);
-  });
-
-  it('DELETE returns 404 when not owned', async () => {
-    const deleteMcpServer = vi.fn().mockResolvedValue(false);
-    const app = makeApp({
-      signalWithStart: vi.fn(),
-      taskQueue: 'chat',
-      deleteMcpServer,
-    });
-    const res = await app.request('/mcp/servers/other', {
-      method: 'DELETE',
-      headers: AUTH,
-    });
-    expect(res.status).toBe(404);
   });
 });
 
