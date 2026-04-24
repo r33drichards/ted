@@ -10,12 +10,13 @@ import { userMessageSignal, closeSignal, transcriptQuery } from './signals.js';
 import { drainInbox } from './inbox.js';
 import type { Msg } from './types.js';
 
-const { streamClaude, persistTurn, generateTitle, getSystemPrompt } =
-  proxyActivities<typeof activities>({
-    startToCloseTimeout: '10 minutes',
-    heartbeatTimeout: '30 seconds',
-    retry: { maximumAttempts: 3 },
-  });
+const { streamClaude, persistTurn, generateTitle } = proxyActivities<
+  typeof activities
+>({
+  startToCloseTimeout: '10 minutes',
+  heartbeatTimeout: '30 seconds',
+  retry: { maximumAttempts: 3 },
+});
 
 const HISTORY_LENGTH_LIMIT = 2000;
 
@@ -30,9 +31,6 @@ export async function chatSession(
   // Only trigger auto-title for the first real turn of a *fresh* session,
   // not after a continue-as-new or when resuming with a seed history.
   let titleGenerated = seedHistory.length > 0;
-
-  // Load once per workflow run; survives continue-as-new via the same DB read.
-  const systemPrompt = (await getSystemPrompt(sessionId)) ?? undefined;
 
   setHandler(userMessageSignal, (msg: string) => {
     inbox.push(msg);
@@ -51,7 +49,7 @@ export async function chatSession(
       await persistTurn({ sessionId, role: 'user', content: userTurn, userId });
     }
 
-    const text = await streamClaude({ sessionId, history, userId, systemPrompt });
+    const text = await streamClaude({ sessionId, history, userId });
     history.push({ role: 'assistant', content: text });
     await persistTurn({ sessionId, role: 'assistant', content: text, userId });
 

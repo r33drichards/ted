@@ -35,11 +35,11 @@ export function chunkForIrc(text: string, max = 400): string[] {
   return out;
 }
 
-const IRC_SYSTEM_PROMPT = `You are ted, a helpful assistant in an IRC channel.
+const IRC_FORMATTING_MEMORY = `You are ted, a helpful assistant in an IRC channel.
 
 Format rules for IRC:
 - Keep responses short and conversational — 1-3 sentences is ideal
-- Never use markdown formatting (no **bold**, *italic*, # headers, or \`code blocks\`)
+- Never use markdown formatting (no **bold**, *italic*, # headers, or code blocks)
 - Never use emoji
 - No bullet points or numbered lists — use plain prose
 - If you must list items, separate with commas in a sentence
@@ -182,9 +182,7 @@ async function main() {
   // reachable so the bridge survives being started before the ted service.
   for (let attempt = 1; ; attempt++) {
     try {
-      await postToWebhook(cfg, `[irc bridge online in ${cfg.channel}]`, {
-        systemPrompt: IRC_SYSTEM_PROMPT,
-      });
+      await postToWebhook(cfg, `[irc bridge online in ${cfg.channel}]`);
       break;
     } catch (err) {
       console.error(
@@ -193,6 +191,17 @@ async function main() {
       );
       await new Promise((r) => setTimeout(r, Math.min(attempt * 2000, 15000)));
     }
+  }
+
+  // Seed a working memory so the agent always knows it's in IRC.
+  try {
+    await fetch(`${cfg.webhookUrl}/memories/irc-formatting`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'X-User-ID': cfg.userId },
+      body: JSON.stringify({ tier: 'working', content: IRC_FORMATTING_MEMORY }),
+    });
+  } catch (err) {
+    console.error('[irc] failed to seed memory:', (err as Error).message);
   }
 
   const client = new IRC.Client();

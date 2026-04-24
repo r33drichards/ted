@@ -10,10 +10,15 @@ import {
   listMcpServers,
   createMcpServer,
   deleteMcpServer,
-  getSessionSystemPrompt,
-  setSessionSystemPrompt,
+  setMemory,
+  getMemory,
+  deleteMemory,
+  listMemories,
+  searchMemories,
+  loadMemoryContext,
   McpNameTakenError,
   type McpServerRow,
+  type MemoryTier,
 } from './db.js';
 import * as mcp from './mcp-client.js';
 import type { Role, StreamReq } from './types.js';
@@ -159,27 +164,83 @@ const BUILTIN_TOOLS: ClaudeTool[] = [
     },
   },
   {
-    name: 'ted__get_system_prompt',
-    description: 'Get the current system prompt for this session.',
-    input_schema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'ted__set_system_prompt',
+    name: 'ted__memory_set',
     description:
-      'Set or update the system prompt for this session. ' +
-      'Takes effect on the next turn. Pass empty string to clear.',
+      'Create or update a memory. Tiers: "working" (always in context), ' +
+      '"short_term" (index in context, read via ted__memory_get), ' +
+      '"long_term" (searchable via ted__memory_search).',
     input_schema: {
       type: 'object',
       properties: {
-        prompt: {
+        tier: {
           type: 'string',
-          description: 'The new system prompt text (empty string to clear)',
+          enum: ['working', 'short_term', 'long_term'],
+          description: 'Memory tier',
+        },
+        key: {
+          type: 'string',
+          description: 'Short identifier for this memory',
+        },
+        content: {
+          type: 'string',
+          description: 'The memory content',
         },
       },
-      required: ['prompt'],
+      required: ['tier', 'key', 'content'],
+    },
+  },
+  {
+    name: 'ted__memory_get',
+    description: 'Read the full content of a memory by key.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Memory key to read' },
+      },
+      required: ['key'],
+    },
+  },
+  {
+    name: 'ted__memory_delete',
+    description: 'Delete a memory by key.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Memory key to delete' },
+      },
+      required: ['key'],
+    },
+  },
+  {
+    name: 'ted__memory_list',
+    description: 'List all memories, optionally filtered by tier.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tier: {
+          type: 'string',
+          enum: ['working', 'short_term', 'long_term'],
+          description: 'Filter by tier (omit for all)',
+        },
+      },
+    },
+  },
+  {
+    name: 'ted__memory_search',
+    description:
+      'Search memories by keyword. Searches both keys and content. ' +
+      'Best for finding long-term memories.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query' },
+        tier: {
+          type: 'string',
+          enum: ['working', 'short_term', 'long_term'],
+          description: 'Filter by tier (omit for all)',
+        },
+      },
+      required: ['query'],
     },
   },
 ];
@@ -271,25 +332,60 @@ async function handleBuiltinTool(
       };
     }
 
-    case 'ted__get_system_prompt': {
-      const current = await getSessionSystemPrompt(sessionId);
+    case 'ted__memory_set': {
+      const tier = String(input.tier ?? '') as MemoryTier;
+      const mKey = String(input.key ?? '').trim();
+      const mContent = String(input.content ?? '');
+      if (!['working', 'short_term', 'long_term'].includes(tier))
+        return { content: 'error: tier must be working, short_term, or long_term', toolsChanged: false };
+      if (!mKey) return { content: 'error: key is required', toolsChanged: false };
+      if (!mContent) return { content: 'error: content is required', toolsChanged: false };
+      await setMemory(userId, tier, mKey, mContent);
+      return { content: `Memory "${mKey}" saved to ${tier}.`, toolsChanged: false };
+    }
+
+    case 'ted__memory_get': {
+      const gKey = String(input.key ?? '').trim();
+      if (!gKey) return { content: 'error: key is required', toolsChanged: false };
+      const mem = await getMemory(userId, gKey);
+      if (!mem) return { content: `No memory found with key "${gKey}".`, toolsChanged: false };
+      return { content: `[${mem.tier}] ${mem.key}:\n${mem.content}`, toolsChanged: false };
+    }
+
+    case 'ted__memory_delete': {
+      const dKey = String(input.key ?? '').trim();
+      if (!dKey) return { content: 'error: key is required', toolsChanged: false };
+      const deleted = await deleteMemory(userId, dKey);
       return {
-        content: current
-          ? `Current system prompt:\n${current}`
-          : 'No system prompt is set for this session.',
+        content: deleted ? `Memory "${dKey}" deleted.` : `No memory found with key "${dKey}".`,
         toolsChanged: false,
       };
     }
 
-    case 'ted__set_system_prompt': {
-      const prompt = String(input.prompt ?? '');
-      await setSessionSystemPrompt(sessionId, prompt || null);
-      return {
-        content: prompt
-          ? 'System prompt updated. It will take effect on the next turn.'
-          : 'System prompt cleared. It will take effect on the next turn.',
-        toolsChanged: false,
-      };
+    case 'ted__memory_list': {
+      const lTier = input.tier ? String(input.tier) as MemoryTier : undefined;
+      const mems = await listMemories(userId, lTier);
+      if (mems.length === 0)
+        return { content: 'No memories found.', toolsChanged: false };
+      const lines = mems.map((m) => {
+        const preview = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
+        return `[${m.tier}] ${m.key}: ${preview}`;
+      });
+      return { content: lines.join('\n'), toolsChanged: false };
+    }
+
+    case 'ted__memory_search': {
+      const q = String(input.query ?? '').trim();
+      if (!q) return { content: 'error: query is required', toolsChanged: false };
+      const sTier = input.tier ? String(input.tier) as MemoryTier : undefined;
+      const results = await searchMemories(userId, q, sTier);
+      if (results.length === 0)
+        return { content: `No memories matching "${q}".`, toolsChanged: false };
+      const lines = results.map((m) => {
+        const preview = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
+        return `[${m.tier}] ${m.key}: ${preview}`;
+      });
+      return { content: lines.join('\n'), toolsChanged: false };
     }
 
     default:
@@ -348,6 +444,13 @@ export async function streamClaude(req: StreamReq): Promise<string> {
   let { tools: mcpTools, byPrefixed } = await gatherMcpTools(req.userId);
   let allTools: ClaudeTool[] = [...BUILTIN_TOOLS, ...mcpTools];
 
+  // Load memories fresh every turn so changes are reflected immediately.
+  const memoryCtx = await loadMemoryContext(req.userId);
+  const systemParts: string[] = [];
+  if (req.systemPrompt) systemParts.push(req.systemPrompt);
+  if (memoryCtx) systemParts.push(memoryCtx);
+  const systemPrompt = systemParts.join('\n\n') || undefined;
+
   // Messages start from history; we append assistant/tool_result rounds here.
   const messages: Array<{ role: string; content: unknown }> = req.history.map(
     (m) => ({ role: m.role, content: m.content }),
@@ -362,7 +465,7 @@ export async function streamClaude(req: StreamReq): Promise<string> {
         max_tokens: MAX_TOKENS,
         messages,
         tools: allTools,
-        ...(req.systemPrompt ? { system: req.systemPrompt } : {}),
+        ...(systemPrompt ? { system: systemPrompt } : {}),
       };
 
       const content = await runOneStream(params, req.sessionId);
@@ -457,10 +560,6 @@ export async function streamClaude(req: StreamReq): Promise<string> {
   } finally {
     await publishTurnEnd(req.sessionId);
   }
-}
-
-export async function getSystemPrompt(sessionId: string): Promise<string | null> {
-  return getSessionSystemPrompt(sessionId);
 }
 
 export type PersistTurnReq = {

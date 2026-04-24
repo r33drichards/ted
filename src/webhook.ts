@@ -18,6 +18,8 @@ import {
   updateMcpServer,
   deleteMcpServer,
   McpNameTakenError,
+  setMemory,
+  type MemoryTier,
 } from './db.js';
 import { subscribeDeltas } from './publish.js';
 import { closeSignal } from './signals.js';
@@ -308,6 +310,20 @@ export function makeApp(deps: AppDeps) {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  });
+
+  app.put('/memories/:key', async (c) => {
+    const userId = c.get('userId');
+    const key = c.req.param('key');
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.content !== 'string' || !body.content) {
+      return c.json({ error: 'content required' }, 400);
+    }
+    const tier: MemoryTier = ['working', 'short_term', 'long_term'].includes(body.tier)
+      ? body.tier
+      : 'working';
+    const row = await setMemory(userId, tier, key, body.content);
+    return c.json({ memory: row });
   });
 
   app.get('/sessions/:sessionId/stream', async (c) => {

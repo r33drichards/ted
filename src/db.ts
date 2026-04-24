@@ -52,6 +52,18 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 );
 CREATE INDEX IF NOT EXISTS mcp_servers_user_enabled_idx
   ON mcp_servers (user_id) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS memories (
+  id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    TEXT        NOT NULL,
+  tier       TEXT        NOT NULL CHECK (tier IN ('working','short_term','long_term')),
+  key        TEXT        NOT NULL,
+  content    TEXT        NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, tier, key)
+);
+CREATE INDEX IF NOT EXISTS memories_user_tier_idx ON memories (user_id, tier);
 `;
 
 export async function ensureSchema(): Promise<void> {
@@ -383,4 +395,136 @@ export async function deleteMcpServer(
     [id, userId],
   );
   return (res.rowCount ?? 0) > 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Memories                                                          */
+/* ------------------------------------------------------------------ */
+
+export type MemoryTier = 'working' | 'short_term' | 'long_term';
+
+export type MemoryRow = {
+  id: string;
+  user_id: string;
+  tier: MemoryTier;
+  key: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+};
+
+const MEM_COLS = 'id, user_id, tier, key, content, created_at, updated_at';
+
+/** Upsert a memory. Returns the row. */
+export async function setMemory(
+  userId: string,
+  tier: MemoryTier,
+  key: string,
+  content: string,
+): Promise<MemoryRow> {
+  const { rows } = await getPool().query<MemoryRow>(
+    `INSERT INTO memories (user_id, tier, key, content)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, tier, key)
+     DO UPDATE SET content = $4, updated_at = now()
+     RETURNING ${MEM_COLS}`,
+    [userId, tier, key, content],
+  );
+  return rows[0]!;
+}
+
+/** Get a single memory by key (any tier). */
+export async function getMemory(
+  userId: string,
+  key: string,
+): Promise<MemoryRow | null> {
+  const { rows } = await getPool().query<MemoryRow>(
+    `SELECT ${MEM_COLS} FROM memories WHERE user_id = $1 AND key = $2`,
+    [userId, key],
+  );
+  return rows[0] ?? null;
+}
+
+/** Delete a memory by key (any tier). */
+export async function deleteMemory(
+  userId: string,
+  key: string,
+): Promise<boolean> {
+  const res = await getPool().query(
+    'DELETE FROM memories WHERE user_id = $1 AND key = $2',
+    [userId, key],
+  );
+  return (res.rowCount ?? 0) > 0;
+}
+
+/** List memories, optionally filtered by tier. */
+export async function listMemories(
+  userId: string,
+  tier?: MemoryTier,
+): Promise<MemoryRow[]> {
+  if (tier) {
+    const { rows } = await getPool().query<MemoryRow>(
+      `SELECT ${MEM_COLS} FROM memories WHERE user_id = $1 AND tier = $2 ORDER BY key`,
+      [userId, tier],
+    );
+    return rows;
+  }
+  const { rows } = await getPool().query<MemoryRow>(
+    `SELECT ${MEM_COLS} FROM memories WHERE user_id = $1 ORDER BY tier, key`,
+    [userId],
+  );
+  return rows;
+}
+
+/** Full-text search across all tiers (or a specific tier). Uses ILIKE for simplicity. */
+export async function searchMemories(
+  userId: string,
+  query: string,
+  tier?: MemoryTier,
+): Promise<MemoryRow[]> {
+  const pattern = `%${query}%`;
+  if (tier) {
+    const { rows } = await getPool().query<MemoryRow>(
+      `SELECT ${MEM_COLS} FROM memories
+        WHERE user_id = $1 AND tier = $2 AND (key ILIKE $3 OR content ILIKE $3)
+        ORDER BY updated_at DESC LIMIT 20`,
+      [userId, tier, pattern],
+    );
+    return rows;
+  }
+  const { rows } = await getPool().query<MemoryRow>(
+    `SELECT ${MEM_COLS} FROM memories
+      WHERE user_id = $1 AND (key ILIKE $2 OR content ILIKE $2)
+      ORDER BY updated_at DESC LIMIT 20`,
+    [userId, pattern],
+  );
+  return rows;
+}
+
+/** Load working memories + short-term index for injection into context. */
+export async function loadMemoryContext(userId: string): Promise<string> {
+  const working = await listMemories(userId, 'working');
+  const shortTerm = await listMemories(userId, 'short_term');
+
+  const parts: string[] = [];
+
+  if (working.length > 0) {
+    parts.push('[Working Memory]');
+    for (const m of working) {
+      parts.push(`${m.key}: ${m.content}`);
+    }
+  }
+
+  if (shortTerm.length > 0) {
+    parts.push('');
+    parts.push('[Short-term Memory — use ted__memory_get to read full content]');
+    for (const m of shortTerm) {
+      const preview = m.content.length > 120
+        ? m.content.slice(0, 120) + '...'
+        : m.content;
+      parts.push(`${m.key}: ${preview}`);
+    }
+  }
+
+  return parts.join('\n');
 }
