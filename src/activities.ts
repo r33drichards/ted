@@ -76,19 +76,18 @@ export async function streamClaude(req: StreamReq): Promise<string> {
 
   // Sandbox filesystem tools to .claude/skills/ only
   const fsGuard = async (input: Record<string, unknown>) => {
+    // Log the full input to understand the hook shape
+    console.log('[fsGuard]', JSON.stringify(input).slice(0, 500));
     // The hook input structure varies — extract any path-like field
     const inp = input as any;
-    const filePath = String(
-      inp.tool_input?.file_path ??
-      inp.tool_input?.path ??
-      inp.tool_input?.pattern ??
-      inp.file_path ??
-      inp.path ??
-      inp.pattern ??
-      '',
-    );
-    // Allow if no path (e.g. Glob with no path defaults to cwd) or path is under skills
-    if (!filePath || filePath.includes('.claude/skills')) {
+    const raw = JSON.stringify(input);
+    // Allow if the path contains .claude/skills anywhere in the input
+    if (raw.includes('.claude/skills') || raw.includes('claude/skills')) {
+      return {};
+    }
+    // Allow Glob/Grep with no specific path (defaults to cwd)
+    const toolName = inp.tool_name ?? inp.tool ?? '';
+    if ((toolName === 'Glob' || toolName === 'Grep') && !inp.tool_input?.path) {
       return {};
     }
     return { decision: 'block' as const, reason: 'Filesystem access restricted to .claude/skills/' };
