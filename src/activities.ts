@@ -74,25 +74,6 @@ export async function streamClaude(req: StreamReq): Promise<string> {
   // Create in-process memory MCP server for this user
   const memoryServer = createMemoryMcpServer(req.userId);
 
-  // Sandbox filesystem tools to .claude/skills/ only
-  const fsGuard = async (input: Record<string, unknown>) => {
-    // Log the full input to understand the hook shape
-    console.log('[fsGuard]', JSON.stringify(input).slice(0, 500));
-    // The hook input structure varies — extract any path-like field
-    const inp = input as any;
-    const raw = JSON.stringify(input);
-    // Allow if the path contains .claude/skills anywhere in the input
-    if (raw.includes('.claude/skills') || raw.includes('claude/skills')) {
-      return { decision: 'approve' as const, reason: 'skills directory access' };
-    }
-    // Allow Glob/Grep with no specific path (defaults to cwd)
-    const toolName = inp.tool_name ?? inp.tool ?? '';
-    if ((toolName === 'Glob' || toolName === 'Grep') && !inp.tool_input?.path) {
-      return { decision: 'approve' as const, reason: 'no path specified' };
-    }
-    return { decision: 'block' as const, reason: 'Filesystem access restricted to .claude/skills/' };
-  };
-
   const options: Options = {
     model: MODEL,
     cwd: '/app',
@@ -106,16 +87,10 @@ export async function streamClaude(req: StreamReq): Promise<string> {
       'mcp__*',
     ],
     disallowedTools: ['Bash', 'Monitor'],
-    permissionMode: 'dontAsk',
+    permissionMode: 'acceptEdits',
     settingSources: ['project'],
     includePartialMessages: true,
     persistSession: false,
-    hooks: {
-      PreToolUse: [{
-        matcher: 'Read|Write|Edit|Glob|Grep',
-        hooks: [fsGuard],
-      }],
-    },
     mcpServers: {
       ...userMcpServers,
       memory: memoryServer,
