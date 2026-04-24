@@ -75,18 +75,23 @@ export async function streamClaude(req: StreamReq): Promise<string> {
   const memoryServer = createMemoryMcpServer(req.userId);
 
   // Sandbox filesystem tools to .claude/skills/ only
-  const SKILLS_DIR = '/app/.claude/skills/';
   const fsGuard = async (input: Record<string, unknown>) => {
+    // The hook input structure varies — extract any path-like field
+    const inp = input as any;
     const filePath = String(
-      (input as any).tool_input?.file_path ??
-      (input as any).tool_input?.path ??
-      (input as any).tool_input?.pattern ??
+      inp.tool_input?.file_path ??
+      inp.tool_input?.path ??
+      inp.tool_input?.pattern ??
+      inp.file_path ??
+      inp.path ??
+      inp.pattern ??
       '',
     );
-    if (filePath && !filePath.startsWith(SKILLS_DIR) && !filePath.startsWith('.claude/skills/')) {
-      return { decision: 'block' as const, reason: `Filesystem access restricted to ${SKILLS_DIR}` };
+    // Allow if no path (e.g. Glob with no path defaults to cwd) or path is under skills
+    if (!filePath || filePath.includes('.claude/skills')) {
+      return {};
     }
-    return {};
+    return { decision: 'block' as const, reason: 'Filesystem access restricted to .claude/skills/' };
   };
 
   const options: Options = {
