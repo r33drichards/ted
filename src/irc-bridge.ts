@@ -162,12 +162,19 @@ async function main() {
     `[irc] connecting to ${cfg.server}:${cfg.port} as ${cfg.nick}, joining ${cfg.channel}`,
   );
 
-  // Prime the session before connecting to IRC
-  try {
-    await postToWebhook(cfg, `[irc bridge online in ${cfg.channel}]`);
-  } catch (err) {
-    console.error('[irc] failed to prime session:', (err as Error).message);
-    process.exit(1);
+  // Prime the session before connecting to IRC — retry until the webhook is
+  // reachable so the bridge survives being started before the ted service.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await postToWebhook(cfg, `[irc bridge online in ${cfg.channel}]`);
+      break;
+    } catch (err) {
+      console.error(
+        `[irc] prime attempt ${attempt} failed:`,
+        (err as Error).message,
+      );
+      await new Promise((r) => setTimeout(r, Math.min(attempt * 2000, 15000)));
+    }
   }
 
   const client = new IRC.Client();
