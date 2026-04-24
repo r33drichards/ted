@@ -37,7 +37,8 @@ const MODEL =
   (useBedrock
     ? 'us.anthropic.claude-haiku-4-5-20251001-v1:0'
     : 'claude-opus-4-5');
-const MAX_TOKENS = 4096;
+const MAX_TOKENS = 16384;
+const THINKING_BUDGET = 10000;
 
 // Max tool-call loop iterations per user turn. Prevents a misbehaving model
 // or server from cycling forever.
@@ -417,12 +418,13 @@ async function runOneStream(
   }).stream(params);
 
   for await (const event of stream) {
-    if (
-      event.type === 'content_block_delta' &&
-      event.delta?.type === 'text_delta' &&
-      typeof event.delta.text === 'string'
-    ) {
-      await publishDelta(sessionId, event.delta.text);
+    if (event.type === 'content_block_delta') {
+      const delta = event.delta as { type: string; text?: string; thinking?: string };
+      if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+        await publishDelta(sessionId, delta.text);
+      } else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+        await publishDelta(sessionId, delta.thinking);
+      }
       heartbeat();
     }
   }
@@ -464,13 +466,18 @@ export async function streamClaude(req: StreamReq): Promise<string> {
         model: MODEL,
         max_tokens: MAX_TOKENS,
         messages,
-        tools: allTools,
+        tools: [
+          ...allTools,
+          { type: 'web_search_20250305' },
+          { type: 'code_execution_20250522' },
+        ],
+        thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET },
         ...(systemPrompt ? { system: systemPrompt } : {}),
       };
 
       const content = await runOneStream(params, req.sessionId);
 
-      // Extract text from this round (even if there are also tool_use blocks).
+      // Extract text from this round (skip thinking blocks, keep text blocks).
       lastAssistantText = content
         .filter((b) => b.type === 'text')
         .map((b) => b.text ?? '')
