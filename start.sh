@@ -25,3 +25,4 @@ case "${SERVICE_TYPE}" in
     exit 1
     ;;
 esac
+
