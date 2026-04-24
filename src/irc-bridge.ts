@@ -75,7 +75,7 @@ function loadConfig(): Config {
     server: must('IRC_SERVER'),
     port: Number(process.env.IRC_PORT ?? 6667),
     tls: process.env.IRC_TLS === 'true',
-    nick: (process.env.IRC_NICK ?? 'ted-bot') + Math.random().toString(36).slice(2, 5),
+    nick: process.env.IRC_NICK ?? 'ted-bot',
     channel,
     sessionId: process.env.IRC_SESSION_ID ?? `irc-${channel.slice(1)}`,
     userId: must('IRC_USER_ID'),
@@ -150,6 +150,7 @@ async function streamToIrc(
   const url = `${cfg.webhookUrl}/sessions/${encodeURIComponent(cfg.sessionId)}/stream`;
   const headers = { 'X-User-ID': cfg.userId };
 
+  let thinking = '';
   let pending = '';
   for await (const data of readSse(url, headers, signal)) {
     let event: { type: string; text?: string; name?: string };
@@ -161,17 +162,22 @@ async function streamToIrc(
     if (event.type === 'delta' && typeof event.text === 'string') {
       pending += event.text;
     } else if (event.type === 'thinking' && typeof event.text === 'string') {
-      pending += event.text;
+      thinking += event.text;
     } else if (event.type === 'tool_call' && event.name) {
       sendPrivmsg(`[using ${event.name}]`);
     } else if (event.type === 'turn_end') {
-      const msg = pending;
-      pending = '';
-      if (msg.trim()) {
-        for (const chunk of chunkForIrc(msg)) {
+      if (thinking.trim()) {
+        for (const chunk of chunkForIrc(`[thinking] ${thinking}`)) {
           sendPrivmsg(chunk);
         }
       }
+      if (pending.trim()) {
+        for (const chunk of chunkForIrc(pending)) {
+          sendPrivmsg(chunk);
+        }
+      }
+      thinking = '';
+      pending = '';
     }
   }
 }
@@ -238,7 +244,9 @@ async function main() {
     'privmsg',
     (event: { target: string; nick: string; message: string }) => {
       if (event.target !== cfg.channel) return;
-      if (event.nick === cfg.nick) return;
+      // Ignore own messages and any stale instances with the same base nick
+      const baseNick = (process.env.IRC_NICK ?? 'ted-bot');
+      if (event.nick.startsWith(baseNick)) return;
       const payload = `${event.nick}: ${event.message}`;
       postToWebhook(cfg, payload).catch((err) =>
         console.error('[irc] webhook post failed:', (err as Error).message),
