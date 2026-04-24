@@ -76,7 +76,7 @@ export async function streamClaude(req: StreamReq): Promise<string> {
 
   const options: Options = {
     model: MODEL,
-    cwd: '/app',
+    cwd: '/app/.claude/skills',
     ...(process.env.CLAUDE_CODE_PATH ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_PATH } : {}),
     systemPrompt,
     allowedTools: [
