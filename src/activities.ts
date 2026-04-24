@@ -83,8 +83,25 @@ export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkS
   let lastAssistantText = '';
   let sdkSessionId = req.sdkSessionId ?? '';
 
+  // If resume fails (stale session), retry without resume
+  async function* runQuery() {
+    try {
+      yield* query({ prompt, options });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('No conversation found') && options.resume) {
+        console.log(`[agent] stale session ${options.resume}, starting fresh`);
+        delete options.resume;
+        sdkSessionId = '';
+        yield* query({ prompt, options });
+      } else {
+        throw err;
+      }
+    }
+  }
+
   try {
-    for await (const message of query({ prompt, options })) {
+    for await (const message of runQuery()) {
       heartbeat();
 
       // Capture session ID from init message
