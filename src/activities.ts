@@ -7,6 +7,10 @@ import {
   touchSession,
   renameSession,
   listEnabledMcpServers,
+  listMcpServers,
+  createMcpServer,
+  deleteMcpServer,
+  McpNameTakenError,
   type McpServerRow,
 } from './db.js';
 import * as mcp from './mcp-client.js';
@@ -101,6 +105,150 @@ async function gatherMcpTools(userId: string): Promise<{
   return { tools, byPrefixed };
 }
 
+/* ------------------------------------------------------------------ */
+/*  Built-in tools — always available, let the agent manage its own   */
+/*  MCP server list without leaving the conversation.                 */
+/* ------------------------------------------------------------------ */
+
+const BUILTIN_TOOLS: ClaudeTool[] = [
+  {
+    name: 'ted__add_mcp_server',
+    description:
+      'Add a remote MCP server so its tools become available to you. ' +
+      'Provide a short name and the HTTP(S) URL of the server. ' +
+      'After adding, the server\'s tools are usable immediately.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description:
+            'Short identifier for this server (e.g. "weather", "github")',
+        },
+        url: {
+          type: 'string',
+          description: 'HTTP(S) URL of the MCP server endpoint',
+        },
+      },
+      required: ['name', 'url'],
+    },
+  },
+  {
+    name: 'ted__list_mcp_servers',
+    description:
+      'List all configured MCP servers, their URLs, and whether they are enabled.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'ted__remove_mcp_server',
+    description: 'Remove an MCP server by name.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Name of the MCP server to remove',
+        },
+      },
+      required: ['name'],
+    },
+  },
+];
+
+const BUILTIN_NAMES = new Set(BUILTIN_TOOLS.map((t) => t.name));
+
+/**
+ * Execute a built-in tool. Returns the textual result and a flag
+ * indicating whether the MCP tool set changed (so the caller can
+ * re-gather).
+ */
+async function handleBuiltinTool(
+  userId: string,
+  name: string,
+  input: Record<string, unknown>,
+): Promise<{ content: string; toolsChanged: boolean }> {
+  switch (name) {
+    case 'ted__add_mcp_server': {
+      const sName = String(input.name ?? '').trim();
+      const sUrl = String(input.url ?? '').trim();
+      if (!sName) return { content: 'error: name is required', toolsChanged: false };
+      if (!sUrl) return { content: 'error: url is required', toolsChanged: false };
+      try {
+        new URL(sUrl); // validate
+      } catch {
+        return { content: `error: invalid url: ${sUrl}`, toolsChanged: false };
+      }
+      try {
+        await createMcpServer(userId, { name: sName, url: sUrl });
+      } catch (err) {
+        if (err instanceof McpNameTakenError) {
+          return {
+            content: `error: a server named "${sName}" already exists`,
+            toolsChanged: false,
+          };
+        }
+        throw err;
+      }
+      // Verify connectivity and list available tools.
+      try {
+        const tools = await mcp.listTools(sUrl);
+        const names = tools.map((t) => t.name).join(', ');
+        return {
+          content:
+            `Added MCP server "${sName}" (${sUrl}). ` +
+            `${tools.length} tool(s) available: ${names}`,
+          toolsChanged: true,
+        };
+      } catch (err) {
+        return {
+          content:
+            `Added MCP server "${sName}" (${sUrl}), but failed to connect: ` +
+            (err instanceof Error ? err.message : String(err)) +
+            '. The server is saved and will be retried on the next turn.',
+          toolsChanged: true,
+        };
+      }
+    }
+
+    case 'ted__list_mcp_servers': {
+      const servers = await listMcpServers(userId);
+      if (servers.length === 0) {
+        return { content: 'No MCP servers configured.', toolsChanged: false };
+      }
+      const lines = servers.map(
+        (s) =>
+          `• ${s.name} — ${s.url} (${s.enabled ? 'enabled' : 'disabled'})`,
+      );
+      return { content: lines.join('\n'), toolsChanged: false };
+    }
+
+    case 'ted__remove_mcp_server': {
+      const rName = String(input.name ?? '').trim();
+      if (!rName)
+        return { content: 'error: name is required', toolsChanged: false };
+      const servers = await listMcpServers(userId);
+      const target = servers.find((s) => s.name === rName);
+      if (!target) {
+        return {
+          content: `No server named "${rName}" found.`,
+          toolsChanged: false,
+        };
+      }
+      await deleteMcpServer(target.id, userId);
+      return {
+        content: `Removed MCP server "${rName}".`,
+        toolsChanged: true,
+      };
+    }
+
+    default:
+      return { content: `unknown builtin tool: ${name}`, toolsChanged: false };
+  }
+}
+
 type ContentBlock = {
   type: string;
   text?: string;
@@ -149,7 +297,8 @@ async function runOneStream(
  * blocks from the last round).
  */
 export async function streamClaude(req: StreamReq): Promise<string> {
-  const { tools, byPrefixed } = await gatherMcpTools(req.userId);
+  let { tools: mcpTools, byPrefixed } = await gatherMcpTools(req.userId);
+  let allTools: ClaudeTool[] = [...BUILTIN_TOOLS, ...mcpTools];
 
   // Messages start from history; we append assistant/tool_result rounds here.
   const messages: Array<{ role: string; content: unknown }> = req.history.map(
@@ -164,8 +313,8 @@ export async function streamClaude(req: StreamReq): Promise<string> {
         model: MODEL,
         max_tokens: MAX_TOKENS,
         messages,
+        tools: allTools,
       };
-      if (tools.length > 0) params.tools = tools;
 
       const content = await runOneStream(params, req.sessionId);
 
@@ -184,8 +333,29 @@ export async function streamClaude(req: StreamReq): Promise<string> {
       // Dispatch each tool call sequentially. Parallel would be fine but
       // sequential keeps error isolation simple.
       const toolResults: ContentBlock[] = [];
+      let toolsChanged = false;
+
       for (const tu of toolUses) {
         const prefixed = tu.name ?? '';
+
+        // Built-in tools (MCP server management)
+        if (BUILTIN_NAMES.has(prefixed)) {
+          heartbeat();
+          const result = await handleBuiltinTool(
+            req.userId,
+            prefixed,
+            (tu.input as Record<string, unknown>) ?? {},
+          );
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: result.content,
+          });
+          if (result.toolsChanged) toolsChanged = true;
+          continue;
+        }
+
+        // MCP server tools
         const lookup = byPrefixed.get(prefixed);
         if (!lookup) {
           toolResults.push({
@@ -219,6 +389,15 @@ export async function streamClaude(req: StreamReq): Promise<string> {
           });
         }
       }
+
+      // If MCP config changed, refresh the tool set for subsequent rounds.
+      if (toolsChanged) {
+        const refreshed = await gatherMcpTools(req.userId);
+        mcpTools = refreshed.tools;
+        byPrefixed = refreshed.byPrefixed;
+        allTools = [...BUILTIN_TOOLS, ...mcpTools];
+      }
+
       messages.push({ role: 'user', content: toolResults });
     }
 
