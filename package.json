@@ -9,6 +9,7 @@
     "build": "tsc -p .",
     "worker": "node --loader ts-node/esm src/worker.ts",
     "webhook": "node --loader ts-node/esm src/webhook.ts",
+    "irc": "node --loader ts-node/esm src/irc-bridge.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p . --noEmit"
