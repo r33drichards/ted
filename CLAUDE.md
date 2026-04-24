@@ -1,49 +1,49 @@
 # Ted
 
-Durable Claude chat app with Temporal workflows, MCP tool integration, and an IRC bridge.
+Durable Claude chat agent powered by the Claude Agent SDK, Temporal workflows, and an IRC bridge.
+
+## Architecture
+
+- `src/activities.ts` — Temporal activities: `streamClaude` (Agent SDK query), `persistTurn`, `generateTitle`
+- `src/memory-mcp.ts` — In-process MCP server for memory CRUD (working/short_term/long_term)
+- `src/workflows.ts` — Temporal chatSession workflow
+- `src/webhook.ts` — Hono HTTP API (message ingestion, sessions, SSE streaming)
+- `src/irc-bridge.ts` — IRC bridge (InspIRCd on Railway private network)
+- `src/db.ts` — Postgres schema + CRUD (messages, sessions, mcp_servers, memories)
+- `src/publish.ts` — Redis Streams for SSE deltas (delta, thinking, tool_call, turn_end)
+- `.claude/skills/` — Agent skills (auto-discovered, self-editable)
+
+## Agent Capabilities
+
+The agent uses the Claude Agent SDK with these tools enabled:
+- Read, Write, Edit, Glob, Grep (filesystem)
+- WebSearch, WebFetch (web)
+- Skill (self-editable skills in .claude/skills/)
+- Agent (subagents)
+- MCP tools (from configured servers)
+- Memory tools (via in-process MCP server)
+
+No Bash or Monitor access.
 
 ## E2E Testing
 
-After deploying changes, run the IRC e2e test to verify the full pipeline:
-
 ```
-node e2e/irc-e2e.mjs
+node e2e/irc-e2e.mjs [--message "text"] [--timeout 90]
 ```
-
-Options:
-- `--message "your message"` — custom test message (default: "what is 2+2?")
-- `--timeout 90` — seconds to wait for response (default: 60)
-
-The test connects to IRC via `railway ssh`, sends a message in #ted, waits for ted-bot's response, and checks: response received, no markdown, reasonable length.
 
 ## Deploy
 
-Push to master. Railway auto-deploys both services (`ted` and `ted-irc-bridge`).
+Push to master. Railway auto-deploys `ted` and `ted-irc-bridge`.
 
-After deploy, if the IRC workflow has changed shape (new/removed activities), terminate the old workflow:
-
+After workflow-shape changes, terminate the old workflow:
 ```
 railway ssh -s ted -- 'node -e "
 const { Connection, Client } = require(\"@temporalio/client\");
 (async () => {
   const conn = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS });
   const client = new Client({ connection: conn });
-  const h = client.workflow.getHandle(\"chat:irc-ted\");
-  await h.terminate(\"deploy reset\");
-  console.log(\"terminated\");
+  await client.workflow.getHandle(\"chat:irc-ted\").terminate(\"deploy reset\");
   process.exit(0);
 })();
 "'
 ```
-
-Then send a message in IRC or restart the bridge to create a fresh workflow.
-
-## Architecture
-
-- `src/activities.ts` — Claude streaming, built-in tools (MCP management, memories), tool loop
-- `src/workflows.ts` — Temporal chatSession workflow
-- `src/webhook.ts` — Hono HTTP API
-- `src/irc-bridge.ts` — IRC bridge (connects to InspIRCd on Railway private network)
-- `src/mcp-client.ts` — MCP HTTP client
-- `src/db.ts` — Postgres schema + CRUD
-- `src/publish.ts` — Redis Streams for SSE deltas (delta, thinking, tool_call, turn_end)

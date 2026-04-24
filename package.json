@@ -30,6 +30,10 @@
     "irc-framework": "^4.14.0",
     "pg": "^8.20.0"
   },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk-linux-x64-musl": "^0.2.119",
+    "@anthropic-ai/claude-agent-sdk-linux-x64-gnu": "^0.2.119"
+  },
   "devDependencies": {
     "@temporalio/testing": "^1.11.0",
     "@types/node": "^20.0.0",
