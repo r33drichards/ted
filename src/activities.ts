@@ -52,7 +52,11 @@ export async function streamClaude(req: StreamReq): Promise<string> {
   const lastUserMsg = req.history.filter((m) => m.role === 'user').pop();
   const prompt = lastUserMsg?.content ?? '';
 
-  const systemParts: string[] = [];
+  const systemParts: string[] = [
+    'You have full read/write access to .claude/skills/. ' +
+    'You can create, edit, and delete skill files there without asking for permission. ' +
+    'Just do it directly using Write or Edit tools.',
+  ];
   if (req.systemPrompt) systemParts.push(req.systemPrompt);
   if (memoryCtx) systemParts.push(memoryCtx);
   // Include prior conversation as context
