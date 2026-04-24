@@ -1,56 +1,9 @@
-import net from 'node:net';
-import tls from 'node:tls';
-
-export type IrcMessage = {
-  prefix?: string;
-  command: string;
-  params: string[];
-};
-
-/**
- * Parse a single IRC line (without trailing CRLF) per RFC 1459 §2.3.1.
- * Returns null for empty input.
- */
-export function parseIrcLine(line: string): IrcMessage | null {
-  let rest = line;
-  if (!rest) return null;
-
-  let prefix: string | undefined;
-  if (rest.startsWith(':')) {
-    const sp = rest.indexOf(' ');
-    if (sp < 0) return null;
-    prefix = rest.slice(1, sp);
-    rest = rest.slice(sp + 1).replace(/^ +/, '');
-  }
-
-  let command: string | undefined;
-  const params: string[] = [];
-  while (rest.length > 0) {
-    if (rest.startsWith(':')) {
-      params.push(rest.slice(1));
-      break;
-    }
-    const sp = rest.indexOf(' ');
-    const tok = sp < 0 ? rest : rest.slice(0, sp);
-    if (!command) command = tok;
-    else params.push(tok);
-    if (sp < 0) break;
-    rest = rest.slice(sp + 1).replace(/^ +/, '');
-  }
-  if (!command) return null;
-  return { prefix, command: command.toUpperCase(), params };
-}
-
-export function nickFromPrefix(prefix: string | undefined): string | null {
-  if (!prefix) return null;
-  const bang = prefix.indexOf('!');
-  return bang < 0 ? prefix : prefix.slice(0, bang);
-}
+import IRC from 'irc-framework';
 
 /**
  * Split arbitrary text into IRC-safe PRIVMSG payloads:
  * - no CR/LF (collapse to spaces)
- * - each chunk ≤ `max` bytes (default 400, well under the 512 line cap
+ * - each chunk <= `max` bytes (default 400, well under the 512 line cap
  *   so prefix + "PRIVMSG #chan :" fits).
  */
 export function chunkForIrc(text: string, max = 400): string[] {
@@ -69,7 +22,6 @@ export function chunkForIrc(text: string, max = 400): string[] {
     if (Buffer.byteLength(word) <= max) {
       buf = word;
     } else {
-      // single oversize word: hard-split on byte boundaries
       let b = Buffer.from(word);
       while (b.length > max) {
         out.push(b.subarray(0, max).toString('utf8'));
@@ -120,59 +72,6 @@ function loadConfig(): Config {
   };
 }
 
-type LineSocket = {
-  write(line: string): void;
-  end(): void;
-};
-
-function connect(cfg: Config, onLine: (line: string) => void): Promise<LineSocket> {
-  return new Promise((resolve, reject) => {
-    const socket = cfg.tls
-      ? tls.connect({ host: cfg.server, port: cfg.port, servername: cfg.server })
-      : net.connect({ host: cfg.server, port: cfg.port });
-
-    let buf = '';
-    const onData = (chunk: Buffer) => {
-      buf += chunk.toString('utf8');
-      let nl: number;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).replace(/\r$/, '');
-        buf = buf.slice(nl + 1);
-        if (line) onLine(line);
-      }
-    };
-
-    const ready = () => {
-      const api: LineSocket = {
-        write(line: string) {
-          socket.write(line + '\r\n');
-        },
-        end() {
-          try {
-            socket.end();
-          } catch {
-            /* ignore */
-          }
-        },
-      };
-      resolve(api);
-    };
-
-    socket.once('error', reject);
-    socket.on('data', onData);
-    socket.on('close', () => {
-      console.error('[irc] connection closed');
-      process.exit(1);
-    });
-
-    if (cfg.tls) {
-      (socket as tls.TLSSocket).once('secureConnect', ready);
-    } else {
-      (socket as net.Socket).once('connect', ready);
-    }
-  });
-}
-
 async function postToWebhook(cfg: Config, msg: string): Promise<void> {
   const res = await fetch(`${cfg.webhookUrl}/message`, {
     method: 'POST',
@@ -189,8 +88,7 @@ async function postToWebhook(cfg: Config, msg: string): Promise<void> {
 }
 
 /**
- * Minimal SSE parser over a fetch Response body. Yields one event
- * per `data:` line. Multi-line events are joined with '\n'.
+ * Minimal SSE parser over a fetch Response body.
  */
 async function* readSse(
   url: string,
@@ -220,11 +118,10 @@ async function* readSse(
         }
         continue;
       }
-      if (raw.startsWith(':')) continue; // comment
+      if (raw.startsWith(':')) continue;
       if (raw.startsWith('data:')) {
         dataLines.push(raw.slice(5).replace(/^ /, ''));
       }
-      // ignore id:/event:/retry: — we don't resume across reconnects
     }
   }
 }
@@ -265,7 +162,7 @@ async function main() {
     `[irc] connecting to ${cfg.server}:${cfg.port} as ${cfg.nick}, joining ${cfg.channel}`,
   );
 
-  // The session must exist before GET /stream succeeds — prime it.
+  // Prime the session before connecting to IRC
   try {
     await postToWebhook(cfg, `[irc bridge online in ${cfg.channel}]`);
   } catch (err) {
@@ -273,51 +170,64 @@ async function main() {
     process.exit(1);
   }
 
-  let sock: LineSocket | null = null;
-  const sendPrivmsg = (text: string) => {
-    if (!sock) return;
-    sock.write(`PRIVMSG ${cfg.channel} :${text}`);
-  };
+  const client = new IRC.Client();
 
-  sock = await connect(cfg, (line) => {
-    const m = parseIrcLine(line);
-    if (!m) return;
+  client.connect({
+    host: cfg.server,
+    port: cfg.port,
+    tls: cfg.tls,
+    nick: cfg.nick,
+    username: cfg.nick,
+    gecos: cfg.nick,
+    password: cfg.password || undefined,
+    auto_reconnect: true,
+    auto_reconnect_wait: 4000,
+    auto_reconnect_max_retries: 0, // unlimited
+  });
 
-    if (m.command === 'PING') {
-      sock?.write(`PONG :${m.params[0] ?? ''}`);
-      return;
-    }
+  client.on('registered', () => {
+    console.log('[irc] registered, joining', cfg.channel);
+    client.join(cfg.channel);
+  });
 
-    // 001 RPL_WELCOME — safe to join now
-    if (m.command === '001') {
-      sock?.write(`JOIN ${cfg.channel}`);
-      return;
-    }
-
-    if (m.command === 'PRIVMSG') {
-      const target = m.params[0];
-      const text = m.params[1] ?? '';
-      if (target !== cfg.channel) return; // ignore PMs
-      const from = nickFromPrefix(m.prefix) ?? 'unknown';
-      if (from === cfg.nick) return; // don't echo ourselves
-      const payload = `${from}: ${text}`;
-      postToWebhook(cfg, payload).catch((err) =>
-        console.error('[irc] webhook post failed:', err.message),
-      );
+  client.on('join', (event: { channel: string; nick: string }) => {
+    if (event.nick === cfg.nick) {
+      console.log('[irc] joined', event.channel);
     }
   });
 
-  if (cfg.password) sock.write(`PASS ${cfg.password}`);
-  sock.write(`NICK ${cfg.nick}`);
-  sock.write(`USER ${cfg.nick} 0 * :${cfg.nick}`);
+  client.on(
+    'privmsg',
+    (event: { target: string; nick: string; message: string }) => {
+      if (event.target !== cfg.channel) return;
+      if (event.nick === cfg.nick) return;
+      const payload = `${event.nick}: ${event.message}`;
+      postToWebhook(cfg, payload).catch((err) =>
+        console.error('[irc] webhook post failed:', (err as Error).message),
+      );
+    },
+  );
+
+  client.on('reconnecting', () => {
+    console.log('[irc] reconnecting...');
+  });
+
+  client.on('close', () => {
+    console.error('[irc] connection closed');
+  });
+
+  const sendPrivmsg = (text: string) => {
+    client.say(cfg.channel, text);
+  };
 
   const abort = new AbortController();
   process.on('SIGINT', () => {
     abort.abort();
-    sock?.end();
+    client.quit('shutting down');
     process.exit(0);
   });
 
+  // Stream webhook responses back to IRC
   while (!abort.signal.aborted) {
     try {
       await streamToIrc(cfg, abort.signal, sendPrivmsg);

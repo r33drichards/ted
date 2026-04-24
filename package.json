@@ -26,6 +26,7 @@
     "@temporalio/workflow": "^1.11.0",
     "hono": "^4.6.0",
     "ioredis": "^5.10.1",
+    "irc-framework": "^4.14.0",
     "pg": "^8.20.0"
   },
   "devDependencies": {

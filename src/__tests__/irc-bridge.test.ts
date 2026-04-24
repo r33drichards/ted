@@ -1,58 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseIrcLine, nickFromPrefix, chunkForIrc } from '../irc-bridge.js';
-
-describe('parseIrcLine', () => {
-  it('parses a PRIVMSG with prefix and trailing', () => {
-    const m = parseIrcLine(':alice!~a@host PRIVMSG #chan :hello world');
-    expect(m).toEqual({
-      prefix: 'alice!~a@host',
-      command: 'PRIVMSG',
-      params: ['#chan', 'hello world'],
-    });
-  });
-
-  it('uppercases the command', () => {
-    expect(parseIrcLine('ping :srv')?.command).toBe('PING');
-  });
-
-  it('parses a command without prefix', () => {
-    expect(parseIrcLine('PING :server.tld')).toEqual({
-      prefix: undefined,
-      command: 'PING',
-      params: ['server.tld'],
-    });
-  });
-
-  it('preserves spaces in the trailing parameter', () => {
-    const m = parseIrcLine(':x PRIVMSG #c :a  b   c');
-    expect(m?.params[1]).toBe('a  b   c');
-  });
-
-  it('handles multiple middle params before trailing', () => {
-    const m = parseIrcLine(':srv 353 bot = #c :alice bob carol');
-    expect(m).toEqual({
-      prefix: 'srv',
-      command: '353',
-      params: ['bot', '=', '#c', 'alice bob carol'],
-    });
-  });
-
-  it('returns null for empty input', () => {
-    expect(parseIrcLine('')).toBeNull();
-  });
-});
-
-describe('nickFromPrefix', () => {
-  it('extracts nick before !', () => {
-    expect(nickFromPrefix('alice!~a@host')).toBe('alice');
-  });
-  it('returns the prefix when no ! present (servername)', () => {
-    expect(nickFromPrefix('irc.server.tld')).toBe('irc.server.tld');
-  });
-  it('returns null for undefined', () => {
-    expect(nickFromPrefix(undefined)).toBeNull();
-  });
-});
+import { chunkForIrc } from '../irc-bridge.js';
 
 describe('chunkForIrc', () => {
   it('collapses newlines and whitespace', () => {
