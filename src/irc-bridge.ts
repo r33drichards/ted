@@ -160,8 +160,8 @@ async function streamToIrc(
     }
     if (event.type === 'delta' && typeof event.text === 'string') {
       pending += event.text;
-    } else if (event.type === 'thinking') {
-      // Skip thinking tokens — don't send to IRC
+    } else if (event.type === 'thinking' && typeof event.text === 'string') {
+      pending += event.text;
     } else if (event.type === 'tool_call' && event.name) {
       sendPrivmsg(`[using ${event.name}]`);
     } else if (event.type === 'turn_end') {
