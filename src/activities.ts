@@ -83,12 +83,12 @@ export async function streamClaude(req: StreamReq): Promise<string> {
     const raw = JSON.stringify(input);
     // Allow if the path contains .claude/skills anywhere in the input
     if (raw.includes('.claude/skills') || raw.includes('claude/skills')) {
-      return {};
+      return { decision: 'approve' as const };
     }
     // Allow Glob/Grep with no specific path (defaults to cwd)
     const toolName = inp.tool_name ?? inp.tool ?? '';
     if ((toolName === 'Glob' || toolName === 'Grep') && !inp.tool_input?.path) {
-      return {};
+      return { decision: 'approve' as const };
     }
     return { decision: 'block' as const, reason: 'Filesystem access restricted to .claude/skills/' };
   };
