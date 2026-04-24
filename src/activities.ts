@@ -70,6 +70,21 @@ export async function streamClaude(req: StreamReq): Promise<string> {
   // Create in-process memory MCP server for this user
   const memoryServer = createMemoryMcpServer(req.userId);
 
+  // Sandbox filesystem tools to .claude/skills/ only
+  const SKILLS_DIR = '/app/.claude/skills/';
+  const fsGuard = async (input: Record<string, unknown>) => {
+    const filePath = String(
+      (input as any).tool_input?.file_path ??
+      (input as any).tool_input?.path ??
+      (input as any).tool_input?.pattern ??
+      '',
+    );
+    if (filePath && !filePath.startsWith(SKILLS_DIR) && !filePath.startsWith('.claude/skills/')) {
+      return { decision: 'block' as const, reason: `Filesystem access restricted to ${SKILLS_DIR}` };
+    }
+    return {};
+  };
+
   const options: Options = {
     model: MODEL,
     cwd: '/app',
@@ -87,6 +102,12 @@ export async function streamClaude(req: StreamReq): Promise<string> {
     settingSources: ['project'],
     includePartialMessages: true,
     persistSession: false,
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Read|Write|Edit|Glob|Grep',
+        hooks: [fsGuard],
+      }],
+    },
     mcpServers: {
       ...userMcpServers,
       memory: memoryServer,
