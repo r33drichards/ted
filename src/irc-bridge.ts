@@ -1,5 +1,7 @@
 // @ts-ignore — no type declarations for irc-framework
 import IRC from 'irc-framework';
+import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
 
 /**
  * Split arbitrary text into IRC-safe PRIVMSG payloads:
@@ -43,10 +45,10 @@ type Config = {
   tls: boolean;
   nick: string;
   channel: string;
-  sessionId: string;
   userId: string;
   webhookUrl: string;
   password?: string;
+  bridgePort: number;
 };
 
 function must(name: string): string {
@@ -66,15 +68,20 @@ function loadConfig(): Config {
     tls: process.env.IRC_TLS === 'true',
     nick: process.env.IRC_NICK ?? 'ted-bot',
     channel,
-    sessionId: process.env.IRC_SESSION_ID ?? `irc-${channel.slice(1)}`,
     userId: must('IRC_USER_ID'),
     webhookUrl: process.env.WEBHOOK_URL ?? 'http://localhost:8787',
     password: process.env.IRC_PASSWORD,
+    bridgePort: Number(process.env.IRC_BRIDGE_PORT ?? 8788),
   };
+}
+
+function sessionForChannel(channel: string): string {
+  return `irc-${channel.replace(/^[#&]/, '')}`;
 }
 
 async function postToWebhook(
   cfg: Config,
+  sessionId: string,
   msg: string,
   extra?: Record<string, unknown>,
 ): Promise<void> {
@@ -84,7 +91,7 @@ async function postToWebhook(
       'content-type': 'application/json',
       'X-User-ID': cfg.userId,
     },
-    body: JSON.stringify({ sessionId: cfg.sessionId, msg, ...extra }),
+    body: JSON.stringify({ sessionId, msg, ...extra }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -133,10 +140,11 @@ async function* readSse(
 
 async function streamToIrc(
   cfg: Config,
+  sessionId: string,
   signal: AbortSignal,
   sendPrivmsg: (text: string) => void,
 ): Promise<void> {
-  const url = `${cfg.webhookUrl}/sessions/${encodeURIComponent(cfg.sessionId)}/stream`;
+  const url = `${cfg.webhookUrl}/sessions/${encodeURIComponent(sessionId)}/stream`;
   const headers = { 'X-User-ID': cfg.userId };
 
   let thinking = '';
@@ -177,11 +185,16 @@ async function main() {
     `[irc] connecting to ${cfg.server}:${cfg.port} as ${cfg.nick}, joining ${cfg.channel}`,
   );
 
-  // Prime the session before connecting to IRC — retry until the webhook is
-  // reachable so the bridge survives being started before the ted service.
+  // Prime the initial channel's session before connecting to IRC — retry
+  // until the webhook is reachable so the bridge survives being started
+  // before the ted service.
   for (let attempt = 1; ; attempt++) {
     try {
-      await postToWebhook(cfg, `[irc bridge online in ${cfg.channel}]`);
+      await postToWebhook(
+        cfg,
+        sessionForChannel(cfg.channel),
+        `[irc bridge online in ${cfg.channel}]`,
+      );
       break;
     } catch (err) {
       console.error(
@@ -207,26 +220,104 @@ async function main() {
     auto_reconnect_max_retries: 0, // unlimited
   });
 
+  const joined = new Set<string>();
+  const streams = new Map<string, AbortController>();
+
+  function startStream(channel: string): void {
+    if (streams.has(channel)) return;
+    const sessionId = sessionForChannel(channel);
+    const abort = new AbortController();
+    streams.set(channel, abort);
+    const sendPrivmsg = (text: string) => {
+      client.say(channel, text);
+    };
+    void (async () => {
+      while (!abort.signal.aborted) {
+        try {
+          await streamToIrc(cfg, sessionId, abort.signal, sendPrivmsg);
+        } catch (err) {
+          if (abort.signal.aborted) return;
+          console.error(
+            `[irc] stream error for ${channel}:`,
+            (err as Error).message,
+          );
+          await new Promise((r) => setTimeout(r, 2000));
+        }
+      }
+    })();
+  }
+
+  function stopStream(channel: string): void {
+    const abort = streams.get(channel);
+    if (abort) {
+      abort.abort();
+      streams.delete(channel);
+    }
+    joined.delete(channel);
+  }
+
   client.on('registered', () => {
     console.log('[irc] registered, joining', cfg.channel);
     client.join(cfg.channel);
+    // After a reconnect, re-JOIN any channels we were already in.
+    for (const ch of joined) {
+      if (ch !== cfg.channel) {
+        console.log('[irc] re-joining', ch);
+        client.join(ch);
+      }
+    }
   });
 
   client.on('join', (event: { channel: string; nick: string }) => {
-    if (event.nick === cfg.nick) {
-      console.log('[irc] joined', event.channel);
+    if (event.nick !== cfg.nick) return;
+    console.log('[irc] joined', event.channel);
+    const wasJoined = joined.has(event.channel);
+    joined.add(event.channel);
+    startStream(event.channel);
+    // Best-effort prime for channels other than the initial one (which was
+    // primed up-front with retry).
+    if (!wasJoined && event.channel !== cfg.channel) {
+      postToWebhook(
+        cfg,
+        sessionForChannel(event.channel),
+        `[irc bridge joined ${event.channel}]`,
+      ).catch((err) =>
+        console.error(
+          `[irc] prime ${event.channel} failed:`,
+          (err as Error).message,
+        ),
+      );
     }
   });
+
+  client.on('part', (event: { channel: string; nick: string }) => {
+    if (event.nick !== cfg.nick) return;
+    console.log('[irc] parted', event.channel);
+    stopStream(event.channel);
+  });
+
+  client.on(
+    'kick',
+    (event: { channel: string; kicked: string; nick: string }) => {
+      if (event.kicked !== cfg.nick) return;
+      console.log('[irc] kicked from', event.channel, 'by', event.nick);
+      stopStream(event.channel);
+    },
+  );
 
   client.on(
     'privmsg',
     (event: { target: string; nick: string; message: string }) => {
-      if (event.target !== cfg.channel) return;
+      if (!joined.has(event.target)) return;
       // Ignore own messages and any stale instances with the same base nick
       const baseNick = (process.env.IRC_NICK ?? 'ted-bot');
       if (event.nick.startsWith(baseNick)) return;
       const payload = `${event.nick}: ${event.message}`;
-      postToWebhook(cfg, payload).catch((err) =>
+      postToWebhook(
+        cfg,
+        sessionForChannel(event.target),
+        payload,
+      ).catch((err) =>
         console.error('[irc] webhook post failed:', (err as Error).message),
       );
     },
@@ -240,27 +331,37 @@ async function main() {
     console.error('[irc] connection closed');
   });
 
-  const sendPrivmsg = (text: string) => {
-    client.say(cfg.channel, text);
-  };
-
-  const abort = new AbortController();
   process.on('SIGINT', () => {
-    abort.abort();
+    for (const abort of streams.values()) abort.abort();
     client.quit('shutting down');
     process.exit(0);
   });
 
-  // Stream webhook responses back to IRC
-  while (!abort.signal.aborted) {
-    try {
-      await streamToIrc(cfg, abort.signal, sendPrivmsg);
-    } catch (err) {
-      if (abort.signal.aborted) return;
-      console.error('[irc] stream error:', (err as Error).message);
-      await new Promise((r) => setTimeout(r, 2000));
+  // HTTP control plane: POST /irc/raw { line }
+  // No auth — bound to Railway's private network.
+  const app = new Hono();
+  app.post('/irc/raw', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof (body as any).line !== 'string') {
+      return c.json({ error: 'line: string required' }, 400);
     }
-  }
+    const line = (body as { line: string }).line.trim();
+    if (!line) return c.json({ error: 'empty line' }, 400);
+    if (/[\r\n]/.test(line)) {
+      return c.json({ error: 'line must not contain CR/LF' }, 400);
+    }
+    if (Buffer.byteLength(line) > 510) {
+      return c.json({ error: 'line exceeds 510 bytes' }, 400);
+    }
+    try {
+      client.raw(line);
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+    return c.json({ ok: true });
+  });
+  console.log(`[irc] bridge HTTP listening on :${cfg.bridgePort}`);
+  serve({ fetch: app.fetch, port: cfg.bridgePort });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -46,7 +46,9 @@ export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkS
     'Each skill goes in its own subdirectory (e.g. skills/dice/SKILL.md). ' +
     'Use the Write or Edit tools directly — no permission needed. ' +
     'You can also add and remove MCP tool servers using mcp__ted__mcp_add, mcp__ted__mcp_list, mcp__ted__mcp_remove. ' +
-    'New servers become available on the next turn.',
+    'New servers become available on the next turn. ' +
+    'You can send raw IRC commands via mcp__ted__irc_raw (e.g. "JOIN #channel", "PRIVMSG #channel :text", "PART #channel :bye"). ' +
+    'After a JOIN the bridge starts a per-channel session and future messages from that channel arrive as new turns.',
   ];
   if (memoryCtx) systemParts.push(memoryCtx);
 
