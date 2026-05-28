@@ -181,6 +181,37 @@ export function createTedMcpServer(userId: string) {
           return { content: [{ type: 'text', text: `Removed "${input.name}".` }] };
         },
       ),
+
+      // ---- IRC bridge ----
+      tool(
+        'irc_raw',
+        'Send a raw IRC command via the IRC bridge. One line, no CR/LF. ' +
+        'Examples: "JOIN #foo", "PART #foo :bye", "PRIVMSG #foo :hello there", ' +
+        '"TOPIC #foo :new topic", "NICK other-nick". After a successful JOIN ' +
+        'the bridge auto-starts a per-channel session (irc-<name without # or &>) ' +
+        'so future privmsgs from that channel will arrive as new turns.',
+        { line: z.string() },
+        async (args) => {
+          const url = process.env.IRC_BRIDGE_URL;
+          if (!url) {
+            return { content: [{ type: 'text', text: 'IRC bridge not configured (IRC_BRIDGE_URL unset).' }] };
+          }
+          try {
+            const res = await fetch(`${url}/irc/raw`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ line: args.line }),
+            });
+            const body = await res.text();
+            if (!res.ok) {
+              return { content: [{ type: 'text', text: `IRC bridge ${res.status}: ${body}` }] };
+            }
+            return { content: [{ type: 'text', text: `IRC: ${args.line}` }] };
+          } catch (err) {
+            return { content: [{ type: 'text', text: `IRC bridge unreachable: ${(err as Error).message}` }] };
+          }
+        },
+      ),
     ],
   });
 }
