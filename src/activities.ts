@@ -7,12 +7,15 @@ import {
   touchSession,
   renameSession,
   loadMemoryContext,
-  listEnabledMcpServers,
 } from './db.js';
 import { createTedMcpServer } from './memory-mcp.js';
 import type { Role, StreamReq } from './types.js';
 
 const MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-5';
+
+// Sandboxed JS execution MCP server (r33drichards/mcp-js) on the Railway
+// private network. Streamable HTTP transport.
+const MCP_JS_URL = process.env.MCP_JS_URL ?? 'http://mcp-js-p1ze.railway.internal:8080/mcp';
 
 /**
  * Stream an assistant turn using the Claude Agent SDK.
@@ -27,26 +30,10 @@ export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkS
   const memoryCtx = await loadMemoryContext(req.userId);
   const tedServer = createTedMcpServer(req.userId);
 
-  // Build MCP servers from user's DB config
-  const dbServers = await listEnabledMcpServers(req.userId);
-  const userMcpServers: Record<string, any> = {};
-  for (const s of dbServers) {
-    if (s.transport === 'stdio' && s.command) {
-      userMcpServers[s.name] = { command: s.command, args: s.args ?? [] };
-    } else if (s.url) {
-      userMcpServers[s.name] = { type: 'http', url: s.url };
-    }
-  }
-
-  const PLUGIN_DIR = '/app/ted-plugin';
-  const SKILLS_DIR = `${PLUGIN_DIR}/skills`;
-
   const systemParts: string[] = [
-    `You can create and edit your own skills by writing SKILL.md files under ${SKILLS_DIR}/. ` +
-    'Each skill goes in its own subdirectory (e.g. skills/dice/SKILL.md). ' +
-    'Use the Write or Edit tools directly — no permission needed. ' +
-    'You can also add and remove MCP tool servers using mcp__ted__mcp_add, mcp__ted__mcp_list, mcp__ted__mcp_remove. ' +
-    'New servers become available on the next turn. ' +
+    'You can execute JavaScript in a sandboxed V8 runtime via the mcp-js tools ' +
+    '(mcp__mcp-js__run_js to queue code, mcp__mcp-js__get_execution / get_execution_output to fetch results). ' +
+    'This is your only way to compute things — you have no filesystem or shell access. ' +
     'You can send raw IRC commands via mcp__ted__irc_raw (e.g. "JOIN #channel", "PRIVMSG #channel :text", "PART #channel :bye"). ' +
     'After a JOIN the bridge starts a per-channel session and future messages from that channel arrive as new turns.',
   ];
@@ -58,25 +45,25 @@ export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkS
   const options: Options = {
     model: MODEL,
     cwd: '/app',
-    additionalDirectories: [SKILLS_DIR],
     ...(process.env.CLAUDE_CODE_PATH ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_PATH } : {}),
     systemPrompt: systemParts.join('\n\n'),
-    plugins: [{ type: 'local', path: PLUGIN_DIR }],
-    allowedTools: [
-      'Read', 'Write', 'Edit',
+    // mcp-js is the agent's only real tool surface (plus TodoWrite and the
+    // built-in ted server for memory/IRC). No filesystem, web, or subagents.
+    allowedTools: ['TodoWrite', 'mcp__ted', 'mcp__mcp-js'],
+    disallowedTools: [
+      'Bash', 'Monitor',
+      'Read', 'Write', 'Edit', 'NotebookEdit',
       'Glob', 'Grep',
       'WebSearch', 'WebFetch',
-      'Skill', 'Agent',
-      'mcp__*',
+      'Skill', 'Agent', 'Task',
     ],
-    disallowedTools: ['Bash', 'Monitor'],
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     settingSources: ['project'],
     includePartialMessages: true,
     mcpServers: {
       ted: tedServer,
-      ...userMcpServers,
+      'mcp-js': { type: 'http', url: MCP_JS_URL },
     },
     // Resume previous SDK session for multi-turn context
     ...(req.sdkSessionId ? { resume: req.sdkSessionId } : {}),
