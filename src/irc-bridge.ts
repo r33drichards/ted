@@ -256,7 +256,10 @@ async function main() {
     joined.delete(channel);
   }
 
+  let everRegistered = false;
+
   client.on('registered', () => {
+    everRegistered = true;
     console.log('[irc] registered, joining', cfg.channel);
     client.join(cfg.channel);
     // After a reconnect, re-JOIN any channels we were already in.
@@ -329,6 +332,14 @@ async function main() {
 
   client.on('close', () => {
     console.error('[irc] connection closed');
+    // If the very first registration attempt dies (e.g. the IRC server is
+    // still holding a ghost connection from a previous container),
+    // irc-framework's auto_reconnect does not always fire. Exit and let the
+    // platform restart policy retry with a clean slate.
+    if (!everRegistered) {
+      console.error('[irc] connection closed before ever registering; exiting for restart');
+      process.exit(1);
+    }
   });
 
   process.on('SIGINT', () => {
