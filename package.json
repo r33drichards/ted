@@ -25,6 +25,7 @@
     "@temporalio/client": "^1.11.0",
     "@temporalio/worker": "^1.11.0",
     "@temporalio/workflow": "^1.11.0",
+    "aws4": "^1.13.2",
     "hono": "^4.6.0",
     "ioredis": "^5.10.1",
     "irc-framework": "^4.14.0",
@@ -32,6 +33,7 @@
   },
   "devDependencies": {
     "@temporalio/testing": "^1.11.0",
+    "@types/aws4": "^1.11.6",
     "@types/node": "^20.0.0",
     "@types/pg": "^8.20.0",
     "ioredis-mock": "^8.13.1",

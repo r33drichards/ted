@@ -7,6 +7,7 @@
  * activity. Each tool execution is its own Temporal activity.
  */
 import { Type, type TSchema } from '@earendil-works/pi-ai';
+import aws4 from 'aws4';
 import { ScheduleOverlapPolicy } from '@temporalio/client';
 import {
   setMemory,
@@ -140,6 +141,53 @@ export async function ircSayLines(channel: string, text: string): Promise<void> 
   for (const chunk of chunks) {
     await ircRawLine(`PRIVMSG ${channel} :${chunk}`);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  WordPress volume filesystem (Wasmer S3)                           */
+/* ------------------------------------------------------------------ */
+
+const WP_S3_MAX_READ = 100_000;
+
+function wpS3Config() {
+  const endpoint = process.env.WP_S3_ENDPOINT;
+  const bucket = process.env.WP_S3_BUCKET;
+  const accessKeyId = process.env.WP_S3_ACCESS_KEY;
+  const secretAccessKey = process.env.WP_S3_SECRET_KEY;
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
+  return { endpoint, bucket, accessKeyId, secretAccessKey };
+}
+
+async function wpS3Request(
+  method: string,
+  path: string,
+  query = '',
+  body?: string,
+): Promise<{ status: number; text: string }> {
+  const cfg = wpS3Config();
+  if (!cfg) throw new Error('WP volume S3 not configured (WP_S3_* env vars unset)');
+  const url = new URL(cfg.endpoint);
+  const fullPath = `/${cfg.bucket}/${path}${query}`;
+  const opts: aws4.Request = {
+    host: url.host,
+    path: fullPath,
+    method,
+    service: 's3',
+    region: 'auto',
+    headers: {},
+    ...(body !== undefined ? { body } : {}),
+  };
+  aws4.sign(opts, {
+    accessKeyId: cfg.accessKeyId,
+    secretAccessKey: cfg.secretAccessKey,
+  });
+  const res = await fetch(`${url.origin}${fullPath}`, {
+    method,
+    headers: opts.headers as Record<string, string>,
+    ...(body !== undefined ? { body } : {}),
+  });
+  const text = await res.text();
+  return { status: res.status, text };
 }
 
 const tierEnum = Type.Union([
@@ -365,6 +413,71 @@ export function createTedTools(userId: string): TedTool[] {
             .map((e) => `${e.name} [${e.status}] best ${e.best_value ?? 'n/a'}${e.metric_unit} — ${e.goal}`)
             .join('\n'),
         };
+      },
+    },
+
+    {
+      name: 'wp_fs',
+      description:
+        'Direct filesystem access to the WordPress site\'s wp-content volume (robw.fyi on ' +
+        'Wasmer) over the volume\'s S3 API — works even when the site itself is returning ' +
+        '500s (e.g. a broken mu-plugin or plugin fatal), making this the disaster-recovery ' +
+        'path. Paths are relative to wp-content/ (e.g. "mu-plugins/broken.php", ' +
+        '"plugins/code-snippets/code-snippets.php", "themes/..."). ' +
+        'IMPORTANT: PHP opcache may keep executing old/deleted files until the app is ' +
+        'redeployed — after changing PHP files, redeploy via the Wasmer GraphQL API ' +
+        '(https://registry.wasmer.io/graphql is auto-authenticated in run_js fetch; ' +
+        'mutation { redeployActiveVersion(input: {id: "da_nQgIotrUdGZW"}) { app { activeVersion { id } } } }) ' +
+        'and re-verify. Never write mu-plugins without validating PHP syntax first — they ' +
+        'run on every request before anything else and a syntax error takes down the whole site.',
+      parameters: Type.Object({
+        op: Type.Union([
+          Type.Literal('list'),
+          Type.Literal('read'),
+          Type.Literal('write'),
+          Type.Literal('delete'),
+        ]),
+        path: Type.String({
+          description: 'Path relative to wp-content/ (for list: a prefix, e.g. "mu-plugins/")',
+        }),
+        content: Type.Optional(Type.String({ description: 'File content (write only)' })),
+      }),
+      execute: async (args) => {
+        const path = String(args.path ?? '').replace(/^\/+/, '');
+        try {
+          switch (args.op) {
+            case 'list': {
+              const r = await wpS3Request('GET', '', `?list-type=2&max-keys=500&prefix=${encodeURIComponent(path)}`);
+              if (r.status !== 200) return { text: `list failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
+              const entries = [...r.text.matchAll(/<Key>([^<]+)<\/Key>(?:<LastModified>([^<]+)<\/LastModified>)?(?:<Size>(\d+)<\/Size>)?/g)]
+                .map((m) => `${m[1]}${m[3] ? ` (${m[3]} bytes)` : ''}`);
+              return { text: entries.length > 0 ? entries.join('\n') : '(no matches)' };
+            }
+            case 'read': {
+              const r = await wpS3Request('GET', path);
+              if (r.status !== 200) return { text: `read failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
+              const body = r.text.length > WP_S3_MAX_READ
+                ? r.text.slice(0, WP_S3_MAX_READ) + `\n… (truncated ${r.text.length - WP_S3_MAX_READ} chars)`
+                : r.text;
+              return { text: body };
+            }
+            case 'write': {
+              if (typeof args.content !== 'string') return { text: 'content required for write', isError: true };
+              const r = await wpS3Request('PUT', path, '', args.content);
+              if (r.status >= 300) return { text: `write failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
+              return { text: `Wrote ${args.content.length} bytes to ${path}.` };
+            }
+            case 'delete': {
+              const r = await wpS3Request('DELETE', path);
+              if (r.status >= 300) return { text: `delete failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
+              return { text: `Deleted ${path}.` };
+            }
+            default:
+              return { text: `Unknown op ${args.op}`, isError: true };
+          }
+        } catch (err) {
+          return { text: `wp_fs ${args.op} failed: ${(err as Error).message}`, isError: true };
+        }
       },
     },
 
