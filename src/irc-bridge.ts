@@ -312,29 +312,38 @@ async function main() {
   const joined = new Set<string>();
   const streams = new Map<string, AbortController>();
 
-  // Outbound pacing: one PRIVMSG per interval so long outputs can't trip
-  // the server's flood protection (RecvQ exceeded → disconnect).
+  // When the bot opers up (IRC_OPER_*), the server grants flood bypass, so
+  // we can drain the queue as fast as possible. Until then (or if opering
+  // is not configured) we pace one PRIVMSG per interval so long outputs
+  // can't trip the server's flood protection (RecvQ exceeded → disconnect).
+  let opered = false;
   const SAY_INTERVAL_MS = Number(process.env.IRC_SAY_INTERVAL_MS ?? 650);
-  const SAY_QUEUE_MAX = Number(process.env.IRC_SAY_QUEUE_MAX ?? 60);
+  const SAY_QUEUE_MAX = Number(process.env.IRC_SAY_QUEUE_MAX ?? 200);
   const sayQueue: Array<{ channel: string; text: string }> = [];
-  setInterval(() => {
+
+  function drainOne(): void {
     const item = sayQueue.shift();
     if (!item) return;
     try {
       client.say(item.channel, item.text);
-    } catch (err) {
-      // Likely mid-reconnect: put it back and retry next tick.
-      sayQueue.unshift(item);
+    } catch {
+      sayQueue.unshift(item); // mid-reconnect — retry next tick
+      return;
     }
-  }, SAY_INTERVAL_MS);
+    // Opered: keep draining this tick (no server-side rate limit).
+    if (opered && sayQueue.length > 0) queueMicrotask(drainOne);
+  }
+  setInterval(drainOne, SAY_INTERVAL_MS);
+
   function enqueueSay(channel: string, text: string): void {
     if (sayQueue.length >= SAY_QUEUE_MAX) {
       if (sayQueue.length === SAY_QUEUE_MAX) {
-        sayQueue.push({ channel, text: '[output dropped: flood protection]' });
+        sayQueue.push({ channel, text: '[output truncated: queue full]' });
       }
       return;
     }
     sayQueue.push({ channel, text });
+    if (opered) drainOne(); // no pacing needed once opered
   }
 
   function startStream(channel: string): void {
@@ -375,6 +384,11 @@ async function main() {
   client.on('registered', () => {
     everRegistered = true;
     console.log('[irc] registered, joining', cfg.channel);
+    // Oper up for flood bypass if configured (server: bot-oper account).
+    opered = false;
+    if (process.env.IRC_OPER_NAME && process.env.IRC_OPER_PASSWORD) {
+      client.raw(`OPER ${process.env.IRC_OPER_NAME} ${process.env.IRC_OPER_PASSWORD}`);
+    }
     client.join(cfg.channel);
     // After a reconnect, re-JOIN any channels we were already in.
     for (const ch of joined) {
@@ -508,6 +522,15 @@ async function main() {
       );
     },
   );
+
+  // RPL_YOUREOPER (381) — flood bypass now active; drain without pacing.
+  client.on('raw', (event: { line?: string; from_server?: boolean }) => {
+    if (event.from_server && typeof event.line === 'string' && / 381 /.test(event.line)) {
+      opered = true;
+      console.log('[irc] opered up — flood bypass active');
+      drainOne();
+    }
+  });
 
   client.on('reconnecting', () => {
     console.log('[irc] reconnecting...');
