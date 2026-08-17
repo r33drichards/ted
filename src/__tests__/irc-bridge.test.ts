@@ -4,7 +4,17 @@ import {
   parseAdminCommand,
   normalizeRawLine,
   parseChannelList,
+  capText,
 } from '../irc-bridge.js';
+
+describe('capText', () => {
+  it('passes short text through', () => {
+    expect(capText('hello', 10)).toBe('hello');
+  });
+  it('truncates long text with a note', () => {
+    expect(capText('a'.repeat(15), 10)).toBe('aaaaaaaaaa … (5 more chars truncated)');
+  });
+});
 
 describe('chunkForIrc', () => {
   it('collapses newlines and whitespace', () => {

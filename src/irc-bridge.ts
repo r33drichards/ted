@@ -2,6 +2,7 @@
 import IRC from 'irc-framework';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
+import { readFileSync, writeFileSync } from 'fs';
 
 /**
  * Split arbitrary text into IRC-safe PRIVMSG payloads:
@@ -35,6 +36,14 @@ export function chunkForIrc(text: string, max = 400): string[] {
   }
   if (buf) out.push(buf);
   return out;
+}
+
+/**
+ * Cap text for IRC relay, keeping the head and noting the truncation.
+ */
+export function capText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)} … (${text.length - max} more chars truncated)`;
 }
 
 /**
@@ -137,13 +146,14 @@ async function postToWebhook(
 }
 
 /**
- * Minimal SSE parser over a fetch Response body.
+ * Minimal SSE parser over a fetch Response body. Yields each event's id
+ * (when present) alongside its data so callers can resume from a cursor.
  */
 async function* readSse(
   url: string,
   headers: Record<string, string>,
   signal: AbortSignal,
-): AsyncGenerator<string> {
+): AsyncGenerator<{ id: string | null; data: string }> {
   const res = await fetch(url, { headers, signal });
   if (!res.ok || !res.body) {
     throw new Error(`sse ${res.status}`);
@@ -152,6 +162,7 @@ async function* readSse(
   const decoder = new TextDecoder('utf-8');
   let buf = '';
   let dataLines: string[] = [];
+  let eventId: string | null = null;
   while (true) {
     const { value, done } = await reader.read();
     if (done) return;
@@ -162,12 +173,17 @@ async function* readSse(
       buf = buf.slice(nl + 1);
       if (raw === '') {
         if (dataLines.length) {
-          yield dataLines.join('\n');
+          yield { id: eventId, data: dataLines.join('\n') };
           dataLines = [];
+          eventId = null;
         }
         continue;
       }
       if (raw.startsWith(':')) continue;
+      if (raw.startsWith('id:')) {
+        eventId = raw.slice(3).replace(/^ /, '');
+        continue;
+      }
       if (raw.startsWith('data:')) {
         dataLines.push(raw.slice(5).replace(/^ /, ''));
       }
@@ -175,18 +191,53 @@ async function* readSse(
   }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Stream cursor persistence — lets the bridge resume a session's    */
+/*  delta stream after an IRC drop or process restart instead of      */
+/*  skipping everything published while it was away.                  */
+/* ------------------------------------------------------------------ */
+
+const STATE_FILE = process.env.BRIDGE_STATE_FILE ?? '/tmp/ted-bridge-state.json';
+
+function loadCursors(): Record<string, string> {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+const streamCursors: Record<string, string> = loadCursors();
+
+function saveCursor(sessionId: string, id: string): void {
+  streamCursors[sessionId] = id;
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify(streamCursors));
+  } catch {
+    // best-effort
+  }
+}
+
+const THINKING_MAX_CHARS = Number(process.env.IRC_THINKING_MAX_CHARS ?? 400);
+const REPLY_MAX_CHARS = Number(process.env.IRC_REPLY_MAX_CHARS ?? 2400);
+
 async function streamToIrc(
   cfg: Config,
   sessionId: string,
   signal: AbortSignal,
   sendPrivmsg: (text: string) => void,
 ): Promise<void> {
-  const url = `${cfg.webhookUrl}/sessions/${encodeURIComponent(sessionId)}/stream`;
+  // Resume from the last relayed event so nothing is lost across IRC
+  // drops or bridge restarts — the Redis stream retains recent history.
+  const cursor = streamCursors[sessionId];
+  const url =
+    `${cfg.webhookUrl}/sessions/${encodeURIComponent(sessionId)}/stream` +
+    (cursor ? `?from=${encodeURIComponent(cursor)}` : '');
   const headers = { 'X-User-ID': cfg.userId };
 
   let thinking = '';
   let pending = '';
-  for await (const data of readSse(url, headers, signal)) {
+  for await (const { id, data } of readSse(url, headers, signal)) {
     let event: { type: string; text?: string; name?: string };
     try {
       event = JSON.parse(data);
@@ -201,18 +252,19 @@ async function streamToIrc(
       sendPrivmsg(`[using ${event.name}]`);
     } else if (event.type === 'turn_end') {
       if (thinking.trim()) {
-        for (const chunk of chunkForIrc(`[thinking] ${thinking}`)) {
+        for (const chunk of chunkForIrc(`[thinking] ${capText(thinking, THINKING_MAX_CHARS)}`)) {
           sendPrivmsg(chunk);
         }
       }
       if (pending.trim()) {
-        for (const chunk of chunkForIrc(pending)) {
+        for (const chunk of chunkForIrc(capText(pending, REPLY_MAX_CHARS))) {
           sendPrivmsg(chunk);
         }
       }
       thinking = '';
       pending = '';
     }
+    if (id) saveCursor(sessionId, id);
   }
 }
 
@@ -260,13 +312,38 @@ async function main() {
   const joined = new Set<string>();
   const streams = new Map<string, AbortController>();
 
+  // Outbound pacing: one PRIVMSG per interval so long outputs can't trip
+  // the server's flood protection (RecvQ exceeded → disconnect).
+  const SAY_INTERVAL_MS = Number(process.env.IRC_SAY_INTERVAL_MS ?? 650);
+  const SAY_QUEUE_MAX = Number(process.env.IRC_SAY_QUEUE_MAX ?? 60);
+  const sayQueue: Array<{ channel: string; text: string }> = [];
+  setInterval(() => {
+    const item = sayQueue.shift();
+    if (!item) return;
+    try {
+      client.say(item.channel, item.text);
+    } catch (err) {
+      // Likely mid-reconnect: put it back and retry next tick.
+      sayQueue.unshift(item);
+    }
+  }, SAY_INTERVAL_MS);
+  function enqueueSay(channel: string, text: string): void {
+    if (sayQueue.length >= SAY_QUEUE_MAX) {
+      if (sayQueue.length === SAY_QUEUE_MAX) {
+        sayQueue.push({ channel, text: '[output dropped: flood protection]' });
+      }
+      return;
+    }
+    sayQueue.push({ channel, text });
+  }
+
   function startStream(channel: string): void {
     if (streams.has(channel)) return;
     const sessionId = sessionForChannel(channel);
     const abort = new AbortController();
     streams.set(channel, abort);
     const sendPrivmsg = (text: string) => {
-      client.say(channel, text);
+      enqueueSay(channel, text);
     };
     void (async () => {
       while (!abort.signal.aborted) {
