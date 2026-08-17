@@ -30,6 +30,9 @@ export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkS
   const memoryCtx = await loadMemoryContext(req.userId);
   const tedServer = createTedMcpServer(req.userId);
 
+  const PLUGIN_DIR = '/app/ted-plugin';
+  const SKILLS_DIR = `${PLUGIN_DIR}/skills`;
+
   const systemParts: string[] = [
     'You can execute JavaScript in a sandboxed V8 runtime via the mcp-js tools ' +
     '(mcp__mcp-js__run_js to queue code, mcp__mcp-js__get_execution / get_execution_output to fetch results). ' +
@@ -45,17 +48,20 @@ export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkS
   const options: Options = {
     model: MODEL,
     cwd: '/app',
+    additionalDirectories: [SKILLS_DIR],
     ...(process.env.CLAUDE_CODE_PATH ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_PATH } : {}),
     systemPrompt: systemParts.join('\n\n'),
-    // mcp-js is the agent's only real tool surface (plus TodoWrite and the
-    // built-in ted server for memory/IRC). No filesystem, web, or subagents.
-    allowedTools: ['TodoWrite', 'mcp__ted', 'mcp__mcp-js'],
+    plugins: [{ type: 'local', path: PLUGIN_DIR }],
+    // mcp-js is the agent's compute surface; no filesystem or shell tools.
+    allowedTools: [
+      'TodoWrite', 'Skill', 'Agent', 'Task',
+      'WebSearch', 'WebFetch', 'Monitor',
+      'mcp__ted', 'mcp__mcp-js',
+    ],
     disallowedTools: [
-      'Bash', 'Monitor',
+      'Bash',
       'Read', 'Write', 'Edit', 'NotebookEdit',
       'Glob', 'Grep',
-      'WebSearch', 'WebFetch',
-      'Skill', 'Agent', 'Task',
     ],
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
