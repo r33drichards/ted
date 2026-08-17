@@ -165,7 +165,14 @@ export function createTedTools(userId: string): TedTool[] {
         'authenticated server-side as admin user r33drichards (no Authorization header ' +
         'needed, credentials are injected at egress) — use the REST API at ' +
         'https://www.robw.fyi/wp-json/wp/v2/... to read and administrate the site ' +
-        '(posts, pages, users, plugins, settings).',
+        '(posts, pages, users, plugins, settings). ' +
+        'Observability: an OTel LGTM stack (Grafana + Loki logs + Tempo traces + ' +
+        'Mimir/Prometheus metrics) runs in-project. Query it from JS via the MCP bridge: ' +
+        '`await mcp.callTool("grafana", "<tool>", args)` — e.g. list_datasources, ' +
+        'query_prometheus, query_loki_logs, list_loki_label_values, search_dashboards. ' +
+        'OTLP ingest endpoints: http://otel-lgtm.railway.internal:4318 (in-project) and ' +
+        'https://otel-lgtm-production-ee87.up.railway.app (public — the WordPress site ' +
+        'exports its OTel telemetry here; paths /v1/traces, /v1/metrics, /v1/logs).',
       parameters: Type.Object({
         code: Type.String({ description: 'JavaScript source to execute' }),
         session: Type.Optional(
