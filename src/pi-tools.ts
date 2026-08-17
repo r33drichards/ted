@@ -97,7 +97,12 @@ export function createTedTools(userId: string): TedTool[] {
       description:
         'Execute JavaScript in a sandboxed V8 runtime (mcp-js). State persists across calls ' +
         'within the same named session via heap snapshots. Returns console output. ' +
-        'No filesystem or network access inside the sandbox by default.',
+        'fetch() has full network access, and external ES modules can be imported with ' +
+        'npm:/jsr: specifiers or https URLs (resolved via esm.sh), e.g. ' +
+        '`import git from "npm:isomorphic-git"`. node: builtins (node:path, node:buffer, ' +
+        'node:url, node:events, ...) and web APIs (URL, streams, TextDecoder, crypto, ' +
+        'CompressionStream) are available. Heap limit 512 MB, execution timeout 120 s — ' +
+        'write results you want to keep to variables; they persist in the session heap.',
       parameters: Type.Object({
         code: Type.String({ description: 'JavaScript source to execute' }),
         session: Type.Optional(
