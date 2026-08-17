@@ -1,11 +1,11 @@
 # Ted
 
-Durable Claude chat agent powered by the Claude Agent SDK, Temporal workflows, and an IRC bridge.
+Durable chat agent powered by the pi agent harness (@earendil-works/pi-coding-agent) running GLM on OpenRouter, Temporal workflows, and an IRC bridge.
 
 ## Architecture
 
-- `src/activities.ts` — Temporal activities: `streamClaude` (Agent SDK query), `persistTurn`, `generateTitle`
-- `src/memory-mcp.ts` — In-process MCP server for memory CRUD (working/short_term/long_term)
+- `src/activities.ts` — Temporal activities: `streamClaude` (pi agent session against OpenRouter), `persistTurn`, `generateTitle`
+- `src/pi-tools.ts` — Custom pi tools: `run_js` (mcp-js REST sidecar), memory CRUD (working/short_term/long_term), `irc_raw`
 - `src/workflows.ts` — Temporal chatSession workflow
 - `src/webhook.ts` — Hono HTTP API (message ingestion, sessions, SSE streaming)
 - `src/irc-bridge.ts` — IRC bridge (InspIRCd on Railway private network)
@@ -15,15 +15,12 @@ Durable Claude chat agent powered by the Claude Agent SDK, Temporal workflows, a
 
 ## Agent Capabilities
 
-The agent uses the Claude Agent SDK with these tools enabled:
-- Read, Write, Edit, Glob, Grep (filesystem)
-- WebSearch, WebFetch (web)
-- Skill (self-editable skills in .claude/skills/)
-- Agent (subagents)
-- MCP tools (from configured servers)
-- Memory tools (via in-process MCP server)
+The agent runs on pi (`createAgentSession`) with built-in coding tools disabled and only these custom tools:
+- `run_js` — sandboxed V8 execution via the mcp-js REST sidecar (`POST /api/exec` on mcp-js-p1ze.railway.internal:8080)
+- `memory_set/get/delete/list/search` — Postgres-backed memory tiers
+- `irc_raw` — raw IRC commands via the bridge's HTTP endpoint
 
-No Bash or Monitor access.
+Model comes from `OPENROUTER_MODEL` (fallback `ANTHROPIC_MODEL`, default `z-ai/glm-5.2`), key from `OR_API_KEY`, thinking level from `PI_THINKING_LEVEL` (default `medium`). Pi session files live on the Railway volume (`RAILWAY_VOLUME_MOUNT_PATH/pi-agent/sessions`); the workflow's `sdkSessionId` is the session file path.
 
 ## E2E Testing
 

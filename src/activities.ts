@@ -1,6 +1,12 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
-import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { heartbeat } from '@temporalio/activity';
+import { existsSync, mkdirSync } from 'fs';
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  ModelRuntime,
+  SessionManager,
+} from '@earendil-works/pi-coding-agent';
+import type { Model } from '@earendil-works/pi-ai';
 import { publishDelta, publishThinking, publishToolCall, publishTurnEnd } from './publish.js';
 import {
   appendMessage,
@@ -8,138 +14,138 @@ import {
   renameSession,
   loadMemoryContext,
 } from './db.js';
-import { createTedMcpServer } from './memory-mcp.js';
+import { createTedTools } from './pi-tools.js';
 import type { Role, StreamReq } from './types.js';
 
-const MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-5';
+// The agent runs on OpenRouter via the pi agent harness (no Claude Code
+// binary, no Anthropic-compat shim).
+const MODEL_ID = process.env.OPENROUTER_MODEL ?? process.env.ANTHROPIC_MODEL ?? 'z-ai/glm-5.2';
+const THINKING_LEVEL = (process.env.PI_THINKING_LEVEL ?? 'medium') as any;
 
-// Sandboxed JS execution MCP server (r33drichards/mcp-js) on the Railway
-// private network. Streamable HTTP transport.
-const MCP_JS_URL = process.env.MCP_JS_URL ?? 'http://mcp-js-p1ze.railway.internal:8080/mcp';
+function openRouterKey(): string {
+  return process.env.OR_API_KEY ?? process.env.OPENROUTER_API_KEY ?? '';
+}
+
+const VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH ?? '/tmp';
+const PI_DIR = process.env.PI_AGENT_DIR ?? `${VOLUME}/pi-agent`;
+const SESSION_DIR = `${PI_DIR}/sessions`;
+
+function tedModel(): Model<'openai-completions'> {
+  return {
+    id: MODEL_ID,
+    name: MODEL_ID,
+    api: 'openai-completions',
+    provider: 'openrouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    reasoning: true,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  };
+}
 
 /**
- * Stream an assistant turn using the Claude Agent SDK.
+ * Stream an assistant turn using the pi agent harness against OpenRouter.
  *
- * Uses SDK session `resume` for multi-turn context — each turn resumes
- * the previous session so the agent has full conversation history without
- * us passing it manually.
+ * Multi-turn context comes from pi's persistent session files (on the
+ * Railway volume); `sdkSessionId` carries the session file path across
+ * turns and continue-as-new.
  *
  * Returns { text, sdkSessionId } so the workflow can track the session.
  */
 export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkSessionId: string }> {
   const memoryCtx = await loadMemoryContext(req.userId);
-  const tedServer = createTedMcpServer(req.userId);
+  mkdirSync(SESSION_DIR, { recursive: true });
 
-  const PLUGIN_DIR = '/app/ted-plugin';
-  const SKILLS_DIR = `${PLUGIN_DIR}/skills`;
+  const modelRuntime = await ModelRuntime.create({ authPath: `${PI_DIR}/auth.json` });
+  await modelRuntime.setRuntimeApiKey('openrouter', openRouterKey());
 
   const systemParts: string[] = [
-    'You can execute JavaScript in a sandboxed V8 runtime via the mcp-js tools ' +
-    '(mcp__mcp-js__run_js to queue code, mcp__mcp-js__get_execution / get_execution_output to fetch results). ' +
-    'This is your only way to compute things — you have no filesystem or shell access. ' +
-    'You can send raw IRC commands via mcp__ted__irc_raw (e.g. "JOIN #channel", "PRIVMSG #channel :text", "PART #channel :bye"). ' +
-    'After a JOIN the bridge starts a per-channel session and future messages from that channel arrive as new turns.',
+    'You are ted, a chat agent bridged into IRC. Keep replies short and IRC-friendly: ' +
+    'plain text, no markdown headers or code fences.',
+    'You can execute JavaScript in a sandboxed V8 runtime via the run_js tool — this is your ' +
+    'only way to compute things. You can persist notes with the memory_* tools, and send raw ' +
+    'IRC commands via irc_raw (e.g. "JOIN #channel", "PRIVMSG #channel :text"). After a JOIN ' +
+    'the bridge starts a per-channel session and future messages from that channel arrive as new turns.',
+    'Always finish your turn with a message to the user summarizing what you did or found — ' +
+    'never end a turn inside reasoning.',
   ];
   if (memoryCtx) systemParts.push(memoryCtx);
+
+  const loader = new DefaultResourceLoader({
+    cwd: '/app',
+    agentDir: PI_DIR,
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    systemPrompt: systemParts.join('\n\n'),
+  });
+  await loader.reload();
+
+  // Resume the previous pi session file when it still exists.
+  let sessionManager: SessionManager;
+  const prior = req.sdkSessionId ?? '';
+  if (prior && existsSync(prior)) {
+    try {
+      sessionManager = SessionManager.open(prior, SESSION_DIR);
+    } catch (err) {
+      console.log(`[agent] failed to open session ${prior} (${(err as Error).message}), starting fresh`);
+      sessionManager = SessionManager.create('/app', SESSION_DIR);
+    }
+  } else {
+    if (prior) console.log(`[agent] stale session ${prior}, starting fresh`);
+    sessionManager = SessionManager.create('/app', SESSION_DIR);
+  }
+
+  const { session } = await createAgentSession({
+    cwd: '/app',
+    agentDir: PI_DIR,
+    modelRuntime,
+    model: tedModel(),
+    thinkingLevel: THINKING_LEVEL,
+    noTools: 'builtin',
+    customTools: createTedTools(req.userId),
+    resourceLoader: loader,
+    sessionManager,
+  });
 
   const lastUserMsg = req.history.filter((m) => m.role === 'user').pop();
   const prompt = lastUserMsg?.content ?? '';
 
-  const options: Options = {
-    model: MODEL,
-    cwd: '/app',
-    additionalDirectories: [SKILLS_DIR],
-    ...(process.env.CLAUDE_CODE_PATH ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_PATH } : {}),
-    systemPrompt: systemParts.join('\n\n'),
-    plugins: [{ type: 'local', path: PLUGIN_DIR }],
-    // mcp-js is the agent's compute surface; no filesystem or shell tools.
-    allowedTools: [
-      'TodoWrite', 'Skill', 'Agent', 'Task',
-      'WebSearch', 'WebFetch', 'Monitor',
-      'mcp__ted', 'mcp__mcp-js',
-    ],
-    disallowedTools: [
-      'Bash',
-      'Read', 'Write', 'Edit', 'NotebookEdit',
-      'Glob', 'Grep',
-    ],
-    permissionMode: 'bypassPermissions',
-    allowDangerouslySkipPermissions: true,
-    settingSources: ['project'],
-    includePartialMessages: true,
-    mcpServers: {
-      ted: tedServer,
-      'mcp-js': { type: 'http', url: MCP_JS_URL },
-    },
-    // Resume previous SDK session for multi-turn context
-    ...(req.sdkSessionId ? { resume: req.sdkSessionId } : {}),
-  };
-
   let lastAssistantText = '';
-  let sdkSessionId = req.sdkSessionId ?? '';
-
-  // If resume fails (stale session), retry without resume
-  async function* runQuery() {
-    try {
-      yield* query({ prompt, options });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('No conversation found') && options.resume) {
-        console.log(`[agent] stale session ${options.resume}, starting fresh`);
-        delete options.resume;
-        sdkSessionId = '';
-        yield* query({ prompt, options });
-      } else {
-        throw err;
+  const unsubscribe = session.subscribe((event) => {
+    heartbeat();
+    if (event.type === 'message_update') {
+      const ev = event.assistantMessageEvent;
+      if (ev.type === 'text_delta' && ev.delta) {
+        void publishDelta(req.sessionId, ev.delta).catch(() => {});
+      } else if (ev.type === 'thinking_delta' && ev.delta) {
+        void publishThinking(req.sessionId, ev.delta).catch(() => {});
+      }
+    } else if (event.type === 'tool_execution_start') {
+      void publishToolCall(req.sessionId, event.toolName).catch(() => {});
+    } else if (event.type === 'turn_end') {
+      const msg = event.message as any;
+      if (msg?.role === 'assistant' && Array.isArray(msg.content)) {
+        const text = msg.content
+          .filter((b: any) => b?.type === 'text')
+          .map((b: any) => b.text ?? '')
+          .join('');
+        if (text.trim()) lastAssistantText = text;
       }
     }
-  }
+  });
 
+  let sdkSessionId = '';
   try {
-    for await (const message of runQuery()) {
-      heartbeat();
-
-      // Capture session ID from init message
-      if (message.type === 'system' && (message as any).subtype === 'init') {
-        sdkSessionId = (message as any).session_id ?? sdkSessionId;
-      }
-
-      // Streaming events (token by token)
-      if (message.type === 'stream_event' && (message as any).event) {
-        const ev = (message as any).event;
-        if (ev.type === 'content_block_delta') {
-          if (ev.delta?.type === 'text_delta' && ev.delta.text) {
-            await publishDelta(req.sessionId, ev.delta.text);
-          } else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) {
-            await publishThinking(req.sessionId, ev.delta.thinking);
-          }
-        } else if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
-          await publishToolCall(req.sessionId, ev.content_block.name ?? 'unknown');
-        }
-      }
-
-      // Complete assistant messages
-      if (message.type === 'assistant') {
-        const msg = (message as any).message;
-        if (msg?.content) {
-          const textParts = (msg.content as any[])
-            .filter((b) => b.type === 'text')
-            .map((b) => b.text ?? '');
-          if (textParts.length > 0) {
-            lastAssistantText = textParts.join('');
-          }
-        }
-      }
-
-      // Result — agent finished this turn
-      if (message.type === 'result') {
-        const result = (message as any).result;
-        if (typeof result === 'string' && result) {
-          lastAssistantText = result;
-        }
-      }
-    }
+    await session.prompt(prompt);
+    sdkSessionId = session.sessionFile ?? '';
   } finally {
+    unsubscribe();
+    session.dispose();
     await publishTurnEnd(req.sessionId);
   }
 
@@ -158,7 +164,8 @@ export async function persistTurn(req: PersistTurnReq): Promise<void> {
   await touchSession(req.sessionId);
 }
 
-const TITLE_MODEL = process.env.ANTHROPIC_TITLE_MODEL ?? 'claude-haiku-4-5';
+const TITLE_MODEL =
+  process.env.OPENROUTER_TITLE_MODEL ?? process.env.ANTHROPIC_TITLE_MODEL ?? MODEL_ID;
 
 export type GenerateTitleReq = {
   sessionId: string;
@@ -168,26 +175,30 @@ export type GenerateTitleReq = {
 
 export async function generateTitle(req: GenerateTitleReq): Promise<void> {
   try {
-    let title = '';
-    for await (const message of query({
-      prompt:
-        'Summarise the following message as a concise 3-6 word chat ' +
-        'title. Reply with ONLY the title text, no quotes, no ' +
-        "punctuation, no leading 'Title:'.\n\n" +
-        req.userMessage,
-      options: {
-        model: TITLE_MODEL,
-        tools: [],
-        permissionMode: 'dontAsk',
-        persistSession: false,
-        ...(process.env.CLAUDE_CODE_PATH ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_PATH } : {}),
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${openRouterKey()}`,
+        'content-type': 'application/json',
       },
-    })) {
-      if (message.type === 'result') {
-        const result = (message as any).result;
-        if (typeof result === 'string') title = result;
-      }
-    }
+      body: JSON.stringify({
+        model: TITLE_MODEL,
+        max_tokens: 64,
+        messages: [
+          {
+            role: 'user',
+            content:
+              'Summarise the following message as a concise 3-6 word chat ' +
+              'title. Reply with ONLY the title text, no quotes, no ' +
+              "punctuation, no leading 'Title:'.\n\n" +
+              req.userMessage,
+          },
+        ],
+      }),
+    });
+    if (!res.ok) return;
+    const json: any = await res.json();
+    let title = String(json?.choices?.[0]?.message?.content ?? '');
     title = title
       .replace(/^["'`]+|["'`]+$/g, '')
       .replace(/\.+$/, '')
