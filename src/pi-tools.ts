@@ -7,8 +7,8 @@
  * activity. Each tool execution is its own Temporal activity.
  */
 import { Type, type TSchema } from '@earendil-works/pi-ai';
-import aws4 from 'aws4';
 import { ScheduleOverlapPolicy } from '@temporalio/client';
+import { wpList, wpRead, wpWrite, wpDelete } from './wp-s3.js';
 import {
   setMemory,
   getMemory,
@@ -143,53 +143,6 @@ export async function ircSayLines(channel: string, text: string): Promise<void> 
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  WordPress volume filesystem (Wasmer S3)                           */
-/* ------------------------------------------------------------------ */
-
-const WP_S3_MAX_READ = 100_000;
-
-function wpS3Config() {
-  const endpoint = process.env.WP_S3_ENDPOINT;
-  const bucket = process.env.WP_S3_BUCKET;
-  const accessKeyId = process.env.WP_S3_ACCESS_KEY;
-  const secretAccessKey = process.env.WP_S3_SECRET_KEY;
-  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
-  return { endpoint, bucket, accessKeyId, secretAccessKey };
-}
-
-async function wpS3Request(
-  method: string,
-  path: string,
-  query = '',
-  body?: string,
-): Promise<{ status: number; text: string }> {
-  const cfg = wpS3Config();
-  if (!cfg) throw new Error('WP volume S3 not configured (WP_S3_* env vars unset)');
-  const url = new URL(cfg.endpoint);
-  const fullPath = `/${cfg.bucket}/${path}${query}`;
-  const opts: aws4.Request = {
-    host: url.host,
-    path: fullPath,
-    method,
-    service: 's3',
-    region: 'auto',
-    headers: {},
-    ...(body !== undefined ? { body } : {}),
-  };
-  aws4.sign(opts, {
-    accessKeyId: cfg.accessKeyId,
-    secretAccessKey: cfg.secretAccessKey,
-  });
-  const res = await fetch(`${url.origin}${fullPath}`, {
-    method,
-    headers: opts.headers as Record<string, string>,
-    ...(body !== undefined ? { body } : {}),
-  });
-  const text = await res.text();
-  return { status: res.status, text };
-}
-
 const tierEnum = Type.Union([
   Type.Literal('working'),
   Type.Literal('short_term'),
@@ -214,10 +167,12 @@ export function createTedTools(userId: string): TedTool[] {
         'needed, credentials are injected at egress) — use the REST API at ' +
         'https://www.robw.fyi/wp-json/wp/v2/... to read and administrate the site ' +
         '(posts, pages, users, plugins, settings). ' +
-        'Observability: an OTel LGTM stack (Grafana + Loki logs + Tempo traces + ' +
-        'Mimir/Prometheus metrics) runs in-project. Query it from JS via the MCP bridge: ' +
-        '`await mcp.callTool("grafana", "<tool>", args)` — e.g. list_datasources, ' +
-        'query_prometheus, query_loki_logs, list_loki_label_values, search_dashboards. ' +
+        'MCP bridge: upstream MCP servers are callable from JS via the `mcp` global — ' +
+        'discover them at runtime with `mcp.servers` and `mcp.listTools(server?)`, call with ' +
+        '`await mcp.callTool(server, tool, args)`. Currently bridged: "grafana" (query the ' +
+        'in-project OTel LGTM stack — Loki logs, Tempo traces, Prometheus metrics, dashboards) ' +
+        'and "wpfs" (WordPress wp-content volume file ops: wp_list/wp_read/wp_write/wp_delete — ' +
+        'works even when the site is down). ' +
         'OTLP ingest endpoints: http://otel-lgtm.railway.internal:4318 (in-project) and ' +
         'https://otel-lgtm-production-ee87.up.railway.app (public — the WordPress site ' +
         'exports its OTel telemetry here; paths /v1/traces, /v1/metrics, /v1/logs).',
@@ -443,35 +398,17 @@ export function createTedTools(userId: string): TedTool[] {
         content: Type.Optional(Type.String({ description: 'File content (write only)' })),
       }),
       execute: async (args) => {
-        const path = String(args.path ?? '').replace(/^\/+/, '');
         try {
           switch (args.op) {
-            case 'list': {
-              const r = await wpS3Request('GET', '', `?list-type=2&max-keys=500&prefix=${encodeURIComponent(path)}`);
-              if (r.status !== 200) return { text: `list failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
-              const entries = [...r.text.matchAll(/<Key>([^<]+)<\/Key>(?:<LastModified>([^<]+)<\/LastModified>)?(?:<Size>(\d+)<\/Size>)?/g)]
-                .map((m) => `${m[1]}${m[3] ? ` (${m[3]} bytes)` : ''}`);
-              return { text: entries.length > 0 ? entries.join('\n') : '(no matches)' };
-            }
-            case 'read': {
-              const r = await wpS3Request('GET', path);
-              if (r.status !== 200) return { text: `read failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
-              const body = r.text.length > WP_S3_MAX_READ
-                ? r.text.slice(0, WP_S3_MAX_READ) + `\n… (truncated ${r.text.length - WP_S3_MAX_READ} chars)`
-                : r.text;
-              return { text: body };
-            }
-            case 'write': {
+            case 'list':
+              return { text: await wpList(String(args.path ?? '')) };
+            case 'read':
+              return { text: await wpRead(String(args.path ?? '')) };
+            case 'write':
               if (typeof args.content !== 'string') return { text: 'content required for write', isError: true };
-              const r = await wpS3Request('PUT', path, '', args.content);
-              if (r.status >= 300) return { text: `write failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
-              return { text: `Wrote ${args.content.length} bytes to ${path}.` };
-            }
-            case 'delete': {
-              const r = await wpS3Request('DELETE', path);
-              if (r.status >= 300) return { text: `delete failed (${r.status}): ${r.text.slice(0, 300)}`, isError: true };
-              return { text: `Deleted ${path}.` };
-            }
+              return { text: await wpWrite(String(args.path ?? ''), args.content) };
+            case 'delete':
+              return { text: await wpDelete(String(args.path ?? '')) };
             default:
               return { text: `Unknown op ${args.op}`, isError: true };
           }

@@ -29,7 +29,8 @@
     "hono": "^4.6.0",
     "ioredis": "^5.10.1",
     "irc-framework": "^4.14.0",
-    "pg": "^8.20.0"
+    "pg": "^8.20.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@temporalio/testing": "^1.11.0",

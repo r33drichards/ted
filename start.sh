@@ -19,6 +19,10 @@ case "${SERVICE_TYPE}" in
     node --loader ts-node/esm src/worker.ts &
     PID_WORKER=$!
 
+    # wpfs MCP server (WordPress volume access for the mcp-js sandbox).
+    # Best-effort: not part of the liveness check.
+    node --loader ts-node/esm src/wpfs-mcp.ts &
+
     trap 'kill $PID_WEBHOOK $PID_WORKER 2>/dev/null; exit' INT TERM
 
     while kill -0 $PID_WEBHOOK 2>/dev/null && kill -0 $PID_WORKER 2>/dev/null; do
