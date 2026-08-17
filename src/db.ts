@@ -68,6 +68,38 @@ CREATE TABLE IF NOT EXISTS memories (
   UNIQUE (user_id, tier, key)
 );
 CREATE INDEX IF NOT EXISTS memories_user_tier_idx ON memories (user_id, tier);
+
+CREATE TABLE IF NOT EXISTS experiments (
+  name            TEXT        PRIMARY KEY,
+  user_id         TEXT        NOT NULL,
+  channel         TEXT        NOT NULL,
+  channel_session TEXT        NOT NULL,
+  goal            TEXT        NOT NULL,
+  metric_name     TEXT        NOT NULL,
+  metric_unit     TEXT        NOT NULL DEFAULT '',
+  direction       TEXT        NOT NULL CHECK (direction IN ('min','max')),
+  measure_code    TEXT        NOT NULL,
+  best_code       TEXT,
+  best_value      DOUBLE PRECISION,
+  status          TEXT        NOT NULL DEFAULT 'running'
+                              CHECK (status IN ('running','paused','stopped','completed')),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS experiments_session_idx ON experiments (channel_session);
+
+CREATE TABLE IF NOT EXISTS experiment_runs (
+  id              BIGSERIAL   PRIMARY KEY,
+  experiment_name TEXT        NOT NULL,
+  iteration       INT         NOT NULL,
+  description     TEXT        NOT NULL,
+  code            TEXT        NOT NULL,
+  samples         JSONB       NOT NULL DEFAULT '[]'::jsonb,
+  value           DOUBLE PRECISION,
+  verdict         TEXT        NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS experiment_runs_name_idx ON experiment_runs (experiment_name, id DESC);
 `;
 
 export async function ensureSchema(): Promise<void> {
@@ -511,6 +543,182 @@ export async function searchMemories(
       WHERE user_id = $1 AND (key ILIKE $2 OR content ILIKE $2)
       ORDER BY updated_at DESC LIMIT 20`,
     [userId, pattern],
+  );
+  return rows;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Experiments (autoresearch)                                        */
+/* ------------------------------------------------------------------ */
+
+export type ExperimentStatus = 'running' | 'paused' | 'stopped' | 'completed';
+
+export type ExperimentRow = {
+  name: string;
+  user_id: string;
+  channel: string;
+  channel_session: string;
+  goal: string;
+  metric_name: string;
+  metric_unit: string;
+  direction: 'min' | 'max';
+  measure_code: string;
+  best_code: string | null;
+  best_value: number | null;
+  status: ExperimentStatus;
+  created_at: string;
+  updated_at: string;
+};
+
+export class ExperimentExistsError extends Error {
+  constructor(name: string) {
+    super(`experiment already exists: ${name}`);
+    this.name = 'ExperimentExistsError';
+  }
+}
+
+const EXP_COLS =
+  'name, user_id, channel, channel_session, goal, metric_name, metric_unit, direction, measure_code, best_code, best_value, status, created_at, updated_at';
+
+export type CreateExperimentInput = {
+  name: string;
+  userId: string;
+  channel: string;
+  channelSession: string;
+  goal: string;
+  metricName: string;
+  metricUnit: string;
+  direction: 'min' | 'max';
+  measureCode: string;
+};
+
+export async function createExperiment(
+  input: CreateExperimentInput,
+): Promise<ExperimentRow> {
+  try {
+    const { rows } = await getPool().query<ExperimentRow>(
+      `INSERT INTO experiments
+         (name, user_id, channel, channel_session, goal, metric_name, metric_unit, direction, measure_code)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING ${EXP_COLS}`,
+      [
+        input.name,
+        input.userId,
+        input.channel,
+        input.channelSession,
+        input.goal,
+        input.metricName,
+        input.metricUnit,
+        input.direction,
+        input.measureCode,
+      ],
+    );
+    return rows[0]!;
+  } catch (err) {
+    if ((err as { code?: string }).code === '23505') {
+      throw new ExperimentExistsError(input.name);
+    }
+    throw err;
+  }
+}
+
+export async function getExperiment(name: string): Promise<ExperimentRow | null> {
+  const { rows } = await getPool().query<ExperimentRow>(
+    `SELECT ${EXP_COLS} FROM experiments WHERE name = $1`,
+    [name],
+  );
+  return rows[0] ?? null;
+}
+
+/** Active experiment (running/paused) whose channel session matches. */
+export async function getExperimentBySession(
+  sessionId: string,
+): Promise<ExperimentRow | null> {
+  const { rows } = await getPool().query<ExperimentRow>(
+    `SELECT ${EXP_COLS} FROM experiments
+      WHERE channel_session = $1 AND status IN ('running','paused')
+      ORDER BY created_at DESC LIMIT 1`,
+    [sessionId],
+  );
+  return rows[0] ?? null;
+}
+
+export async function listExperiments(userId: string): Promise<ExperimentRow[]> {
+  const { rows } = await getPool().query<ExperimentRow>(
+    `SELECT ${EXP_COLS} FROM experiments WHERE user_id = $1 ORDER BY created_at DESC`,
+    [userId],
+  );
+  return rows;
+}
+
+export async function setExperimentStatus(
+  name: string,
+  status: ExperimentStatus,
+): Promise<void> {
+  await getPool().query(
+    'UPDATE experiments SET status = $2, updated_at = now() WHERE name = $1',
+    [name, status],
+  );
+}
+
+export async function setExperimentBest(
+  name: string,
+  value: number,
+  code: string,
+): Promise<void> {
+  await getPool().query(
+    'UPDATE experiments SET best_value = $2, best_code = $3, updated_at = now() WHERE name = $1',
+    [name, value, code],
+  );
+}
+
+export type ExperimentRunRow = {
+  id: string;
+  experiment_name: string;
+  iteration: number;
+  description: string;
+  code: string;
+  samples: number[];
+  value: number | null;
+  verdict: string;
+  created_at: string;
+};
+
+export async function appendExperimentRun(input: {
+  name: string;
+  iteration: number;
+  description: string;
+  code: string;
+  samples: number[];
+  value: number | null;
+  verdict: string;
+}): Promise<void> {
+  await getPool().query(
+    `INSERT INTO experiment_runs
+       (experiment_name, iteration, description, code, samples, value, verdict)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
+    [
+      input.name,
+      input.iteration,
+      input.description,
+      input.code,
+      JSON.stringify(input.samples),
+      input.value,
+      input.verdict,
+    ],
+  );
+}
+
+/** Most recent runs, newest first. */
+export async function listExperimentRuns(
+  name: string,
+  limit = 10,
+): Promise<ExperimentRunRow[]> {
+  const { rows } = await getPool().query<ExperimentRunRow>(
+    `SELECT id, experiment_name, iteration, description, code, samples, value, verdict, created_at
+       FROM experiment_runs WHERE experiment_name = $1
+      ORDER BY id DESC LIMIT $2`,
+    [name, limit],
   );
   return rows;
 }

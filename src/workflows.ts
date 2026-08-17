@@ -7,8 +7,14 @@ import {
 } from '@temporalio/workflow';
 import type * as activities from './activities.js';
 import type { Message, ToolCall } from '@earendil-works/pi-ai';
-import { userMessageSignal, closeSignal, transcriptQuery } from './signals.js';
+import {
+  userMessageSignal,
+  closeSignal,
+  transcriptQuery,
+  experimentSteerSignal,
+} from './signals.js';
 import { drainInbox } from './inbox.js';
+import { decideVerdict, formatRunLine, type Direction } from './experiments.js';
 import type { Msg } from './types.js';
 
 const { llmTurn, persistTurn, generateTitle } = proxyActivities<typeof activities>({
@@ -22,6 +28,21 @@ const { llmTurn, persistTurn, generateTitle } = proxyActivities<typeof activitie
 const { executeTool, endTurn } = proxyActivities<typeof activities>({
   startToCloseTimeout: '5 minutes',
   retry: { maximumAttempts: 2 },
+});
+
+// Autoresearch activities.
+const { proposeCandidate, finishExperiment } = proxyActivities<typeof activities>({
+  startToCloseTimeout: '10 minutes',
+  retry: { maximumAttempts: 3 },
+});
+const { measureCandidate } = proxyActivities<typeof activities>({
+  startToCloseTimeout: '15 minutes',
+  heartbeatTimeout: '3 minutes',
+  retry: { maximumAttempts: 2 },
+});
+const { recordExperimentRun, ircSay } = proxyActivities<typeof activities>({
+  startToCloseTimeout: '1 minute',
+  retry: { maximumAttempts: 3 },
 });
 
 const HISTORY_LENGTH_LIMIT = 2000;
@@ -144,4 +165,113 @@ export async function chatSession(
       await continueAsNew<typeof chatSession>(sessionId, history, userId, convo);
     }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Autoresearch: autonomous experiment loop                          */
+/* ------------------------------------------------------------------ */
+
+const EXPERIMENT_MAX_ITERATIONS = 200;
+const EXPERIMENT_CAN_INTERVAL = 25;
+const EXPERIMENT_SAMPLES = 3;
+
+/** Strip the `nick: ` prefix the bridge prepends to channel messages. */
+function steerText(msg: string): string {
+  return msg.replace(/^[^\s:]+:\s*/, '').trim();
+}
+
+/**
+ * Autonomous optimization loop (pi-autoresearch pattern): propose a
+ * candidate (LLM activity) → measure it in the mcp-js sandbox (activity)
+ * → keep/discard vs the current best → log + report to the experiment's
+ * IRC channel. Steered by messages in that channel (stop/pause/resume/
+ * status are commands; anything else is guidance for the next proposal).
+ */
+export async function autoresearch(
+  name: string,
+  userId: string,
+  channel: string,
+  direction: Direction,
+  metricUnit: string,
+  startIteration: number = 0,
+): Promise<void> {
+  const steering: string[] = [];
+  setHandler(experimentSteerSignal, (msg: string) => {
+    steering.push(msg);
+  });
+
+  let iteration = startIteration;
+  let paused = false;
+  let stopped = false;
+  let stopReason = '';
+  let best: number | null = null;
+  const guidance: string[] = [];
+
+  while (!stopped && iteration < EXPERIMENT_MAX_ITERATIONS) {
+    for (const raw of steering.splice(0)) {
+      const text = steerText(raw);
+      const cmd = text.toLowerCase();
+      if (cmd === 'stop') {
+        stopped = true;
+        stopReason = 'stopped by operator';
+      } else if (cmd === 'pause') {
+        paused = true;
+        await ircSay({ channel, text: `paused at #${iteration} — say "resume" to continue` });
+      } else if (cmd === 'resume') {
+        paused = false;
+        await ircSay({ channel, text: `resuming at #${iteration}` });
+      } else if (cmd === 'status') {
+        await ircSay({
+          channel,
+          text: `iteration ${iteration}, best ${best ?? 'n/a'}${metricUnit}, ${paused ? 'paused' : 'running'}`,
+        });
+      } else if (text) {
+        guidance.push(text);
+        await ircSay({ channel, text: `noted — will apply to the next candidate` });
+      }
+    }
+    if (stopped) break;
+    if (paused) {
+      await condition(() => steering.length > 0);
+      continue;
+    }
+
+    const proposal = await proposeCandidate({ name, userId, guidance: guidance.splice(0) });
+    best = proposal.bestValue;
+    if (proposal.stop) {
+      stopped = true;
+      stopReason = proposal.reason || 'model concluded the search';
+      break;
+    }
+
+    const measured = await measureCandidate({ name, code: proposal.code, samples: EXPERIMENT_SAMPLES });
+    const { verdict, value } = decideVerdict(measured.values, best, direction);
+    if (verdict === 'keep' || verdict === 'baseline') best = value;
+
+    iteration++;
+    await recordExperimentRun({
+      name,
+      iteration,
+      description: proposal.description,
+      code: proposal.code,
+      samples: measured.values,
+      value,
+      verdict,
+    });
+    await ircSay({
+      channel,
+      text: formatRunLine(iteration, verdict, value, best, metricUnit, proposal.description),
+    });
+
+    if (iteration % EXPERIMENT_CAN_INTERVAL === 0 && iteration < EXPERIMENT_MAX_ITERATIONS) {
+      await continueAsNew<typeof autoresearch>(name, userId, channel, direction, metricUnit, iteration);
+    }
+  }
+
+  const status = stopReason.startsWith('stopped') ? 'stopped' : 'completed';
+  await finishExperiment({ name, status });
+  await ircSay({
+    channel,
+    text: `experiment "${name}" ${status} after ${iteration} iteration(s); best ${best ?? 'n/a'}${metricUnit}. ${stopReason}`,
+  });
 }

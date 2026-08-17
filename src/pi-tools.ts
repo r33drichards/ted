@@ -13,8 +13,16 @@ import {
   deleteMemory,
   listMemories,
   searchMemories,
+  createExperiment,
+  getExperiment,
+  listExperiments,
+  listExperimentRuns,
+  setExperimentStatus,
+  ExperimentExistsError,
   type MemoryTier,
 } from './db.js';
+import { getTemporalClient, TASK_QUEUE } from './temporal-client.js';
+import { experimentSteerSignal } from './signals.js';
 
 export type TedTool = {
   name: string;
@@ -47,11 +55,11 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   }
 }
 
-async function runJs(code: string, session: string): Promise<string> {
+export async function runJs(code: string, session?: string): Promise<string> {
   const submitted = await fetchJson(`${MCP_JS_ORIGIN}/api/exec`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code, session }),
+    body: JSON.stringify(session ? { code, session } : { code }),
   });
 
   // Stateless mode returns { output, error } directly.
@@ -82,6 +90,40 @@ async function runJs(code: string, session: string): Promise<string> {
 
   const statusJson = typeof last === 'string' ? last : JSON.stringify(last);
   return `status: ${statusJson}\noutput:\n${output || '(no output)'}`;
+}
+
+/** Send one raw IRC line via the bridge's private HTTP endpoint. */
+export async function ircRawLine(line: string): Promise<void> {
+  const url = process.env.IRC_BRIDGE_URL;
+  if (!url) throw new Error('IRC bridge not configured (IRC_BRIDGE_URL unset)');
+  const res = await fetch(`${url}/irc/raw`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ line }),
+  });
+  if (!res.ok) throw new Error(`IRC bridge ${res.status}: ${await res.text()}`);
+}
+
+/** Say text in a channel, split into IRC-safe chunks. */
+export async function ircSayLines(channel: string, text: string): Promise<void> {
+  const oneline = text.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!oneline) return;
+  const words = oneline.split(' ');
+  const chunks: string[] = [];
+  let buf = '';
+  for (const word of words) {
+    const candidate = buf ? `${buf} ${word}` : word;
+    if (Buffer.byteLength(candidate) <= 400) {
+      buf = candidate;
+    } else {
+      if (buf) chunks.push(buf);
+      buf = word.slice(0, 400);
+    }
+  }
+  if (buf) chunks.push(buf);
+  for (const chunk of chunks) {
+    await ircRawLine(`PRIVMSG ${channel} :${chunk}`);
+  }
 }
 
 const tierEnum = Type.Union([
@@ -184,6 +226,117 @@ export function createTedTools(userId: string): TedTool[] {
           return `[${m.tier}] ${m.key}: ${preview}`;
         });
         return { text: lines.join('\n') };
+      },
+    },
+
+    {
+      name: 'experiment_start',
+      description:
+        'Start an autonomous autoresearch experiment (pi-autoresearch pattern): a durable ' +
+        'loop that repeatedly proposes candidate JavaScript, measures it in the sandbox, and ' +
+        'keeps only what improves the metric. Creates IRC channel #auto-<name> for progress ' +
+        'and steering (say "stop", "pause", "resume", "status", or free-form guidance there). ' +
+        'The measure snippet runs after the candidate code in the same execution and must ' +
+        'print "METRIC <metric_name>=<number>".',
+      parameters: Type.Object({
+        name: Type.String({ description: 'Short slug, lowercase letters/digits/hyphens (e.g. "fib-speed")' }),
+        goal: Type.String({ description: 'What to optimize, in plain language' }),
+        metric_name: Type.String({ description: 'Metric identifier printed by the measure snippet' }),
+        metric_unit: Type.Optional(Type.String({ description: 'Unit suffix for display (e.g. "ms")' })),
+        direction: Type.Union([Type.Literal('min'), Type.Literal('max')]),
+        measure_code: Type.String({
+          description: 'JS that measures the candidate and prints METRIC <metric_name>=<number>',
+        }),
+      }),
+      execute: async (args) => {
+        const name = String(args.name ?? '').trim();
+        if (!/^[a-z0-9][a-z0-9-]{0,29}$/.test(name)) {
+          return { text: 'Invalid name: use lowercase letters, digits, hyphens (max 30 chars).', isError: true };
+        }
+        const channel = `#auto-${name}`;
+        const channelSession = `irc-auto-${name}`;
+        try {
+          await createExperiment({
+            name,
+            userId,
+            channel,
+            channelSession,
+            goal: String(args.goal),
+            metricName: String(args.metric_name),
+            metricUnit: String(args.metric_unit ?? ''),
+            direction: args.direction as 'min' | 'max',
+            measureCode: String(args.measure_code),
+          });
+        } catch (err) {
+          if (err instanceof ExperimentExistsError) {
+            return { text: `Experiment "${name}" already exists. Pick another name or stop it first.`, isError: true };
+          }
+          throw err;
+        }
+        try {
+          await ircRawLine(`JOIN ${channel}`);
+        } catch (err) {
+          // Not fatal: the loop still runs; results just have nowhere to post
+          // until the bridge joins the channel.
+        }
+        const client = await getTemporalClient();
+        await client.workflow.start('autoresearch', {
+          workflowId: `auto:${name}`,
+          taskQueue: TASK_QUEUE,
+          args: [name, userId, channel, args.direction, String(args.metric_unit ?? '')],
+        });
+        return {
+          text:
+            `Experiment "${name}" started — follow it in ${channel}. ` +
+            `Say "status", "pause", "resume", "stop", or free-form guidance there.`,
+        };
+      },
+    },
+
+    {
+      name: 'experiment_stop',
+      description: 'Stop a running autoresearch experiment by name.',
+      parameters: Type.Object({ name: Type.String() }),
+      execute: async (args) => {
+        const name = String(args.name ?? '').trim();
+        const exp = await getExperiment(name);
+        if (!exp) return { text: `No experiment named "${name}".`, isError: true };
+        try {
+          const client = await getTemporalClient();
+          await client.workflow.getHandle(`auto:${name}`).signal(experimentSteerSignal, 'stop');
+          return { text: `Stop signal sent to experiment "${name}".` };
+        } catch {
+          await setExperimentStatus(name, 'stopped');
+          return { text: `Experiment "${name}" marked stopped (workflow was not running).` };
+        }
+      },
+    },
+
+    {
+      name: 'experiment_status',
+      description: 'Show autoresearch experiments and their current best values.',
+      parameters: Type.Object({
+        name: Type.Optional(Type.String({ description: 'Experiment name; omit to list all' })),
+      }),
+      execute: async (args) => {
+        if (args.name) {
+          const exp = await getExperiment(String(args.name));
+          if (!exp) return { text: `No experiment named "${args.name}".`, isError: true };
+          const runs = await listExperimentRuns(exp.name, 5);
+          const lines = [
+            `${exp.name} [${exp.status}] ${exp.channel} — ${exp.goal}`,
+            `metric ${exp.metric_name} (${exp.direction}), best ${exp.best_value ?? 'n/a'}${exp.metric_unit}`,
+            ...runs.reverse().map((r) => `#${r.iteration} ${r.verdict} ${r.value ?? 'n/a'} — ${r.description}`),
+          ];
+          return { text: lines.join('\n') };
+        }
+        const exps = await listExperiments(userId);
+        if (exps.length === 0) return { text: 'No experiments yet.' };
+        return {
+          text: exps
+            .map((e) => `${e.name} [${e.status}] best ${e.best_value ?? 'n/a'}${e.metric_unit} — ${e.goal}`)
+            .join('\n'),
+        };
       },
     },
 

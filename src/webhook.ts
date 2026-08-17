@@ -3,9 +3,10 @@ import { streamSSE } from 'hono/streaming';
 import { serve } from '@hono/node-server';
 import { Client, Connection } from '@temporalio/client';
 import { chatSession } from './workflows.js';
-import { userMessageSignal, closeSignal } from './signals.js';
+import { userMessageSignal, closeSignal, experimentSteerSignal } from './signals.js';
 import {
   ensureSchema,
+  getExperimentBySession,
   getMessages,
   getSessions,
   createSession,
@@ -29,6 +30,8 @@ export function makeApp(deps: {
   taskQueue: string;
   signalClose?: (workflowId: string) => Promise<void>;
   terminateLegacy?: (workflowId: string) => Promise<void>;
+  /** Route a message to an active experiment for this session. Returns true if handled. */
+  steerExperiment?: (sessionId: string, msg: string) => Promise<boolean>;
 }) {
   const app = new Hono<{ Variables: Vars }>();
   const legacyCleaned = new Set<string>();
@@ -62,6 +65,12 @@ export function makeApp(deps: {
       if (!nowOwned) {
         return c.json({ error: 'session belongs to another user' }, 403);
       }
+    }
+
+    // Messages in an active experiment's channel steer the experiment
+    // workflow instead of the channel's chat session.
+    if (await deps.steerExperiment?.(body.sessionId, body.msg)) {
+      return c.json({ ok: true, routed: 'experiment' });
     }
 
     // Best-effort: terminate the pre-refactor workflow for this session once.
@@ -189,6 +198,21 @@ async function main() {
         await client.workflow.getHandle(workflowId).terminate('superseded by chat2 workflow shape');
         console.log(`[webhook] terminated legacy workflow ${workflowId}`);
       } catch { /* not running — nothing to do */ }
+    },
+    steerExperiment: async (sessionId, msg) => {
+      const exp = await getExperimentBySession(sessionId).catch(() => null);
+      if (!exp) return false;
+      // Swallow the bridge's own join/prime notices; steer everything else.
+      if (!msg.includes('[irc bridge')) {
+        try {
+          await client.workflow
+            .getHandle(`auto:${exp.name}`)
+            .signal(experimentSteerSignal, msg);
+        } catch (err) {
+          console.error(`[webhook] experiment steer failed for ${exp.name}:`, (err as Error).message);
+        }
+      }
+      return true;
     },
   });
 

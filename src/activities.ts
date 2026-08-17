@@ -1,5 +1,5 @@
 import { heartbeat } from '@temporalio/activity';
-import { streamSimple } from '@earendil-works/pi-ai/compat';
+import { streamSimple, completeSimple } from '@earendil-works/pi-ai/compat';
 import type {
   AssistantMessage,
   Context,
@@ -15,8 +15,15 @@ import {
   touchSession,
   renameSession,
   loadMemoryContext,
+  getExperiment,
+  listExperimentRuns,
+  appendExperimentRun as dbAppendExperimentRun,
+  setExperimentBest,
+  setExperimentStatus,
+  type ExperimentStatus,
 } from './db.js';
-import { createTedTools } from './pi-tools.js';
+import { createTedTools, runJs, ircSayLines } from './pi-tools.js';
+import { parseMetricValues } from './experiments.js';
 import type { Role } from './types.js';
 
 // The agent runs on OpenRouter via pi-ai. The workflow drives the agent
@@ -176,6 +183,160 @@ export type PersistTurnReq = {
 export async function persistTurn(req: PersistTurnReq): Promise<void> {
   await appendMessage(req.sessionId, req.role, req.content, req.userId);
   await touchSession(req.sessionId);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Autoresearch activities                                           */
+/* ------------------------------------------------------------------ */
+
+export type ProposeCandidateReq = {
+  name: string;
+  userId: string;
+  guidance: string[];
+};
+
+export type CandidateProposal = {
+  stop: boolean;
+  reason?: string;
+  description: string;
+  code: string;
+  bestValue: number | null;
+};
+
+/**
+ * One LLM call proposing the next experiment candidate as JSON:
+ * {"description": "...", "code": "..."} or {"stop": true, "reason": "..."}.
+ */
+export async function proposeCandidate(req: ProposeCandidateReq): Promise<CandidateProposal> {
+  const exp = await getExperiment(req.name);
+  if (!exp) throw new Error(`experiment not found: ${req.name}`);
+  const runs = await listExperimentRuns(req.name, 10);
+
+  const logLines = runs
+    .slice()
+    .reverse()
+    .map((r) => `#${r.iteration} ${r.verdict} value=${r.value ?? 'n/a'} — ${r.description}`);
+
+  const prompt = [
+    `You are running an autonomous optimization loop ("autoresearch").`,
+    `Goal: ${exp.goal}`,
+    `Metric: ${exp.metric_name} (${exp.metric_unit || 'unitless'}), direction: ${exp.direction === 'min' ? 'lower is better' : 'higher is better'}.`,
+    ``,
+    `The candidate is JavaScript run in a sandboxed V8 runtime (network fetch available, npm:/jsr:/https module imports via esm.sh, node: builtins). ` +
+    `Your candidate code runs first, then this measurement snippet runs in the same execution and must be able to use what the candidate defines:`,
+    '--- measure snippet ---',
+    exp.measure_code,
+    '--- end measure snippet ---',
+    `The measurement prints lines like "METRIC ${exp.metric_name}=<number>".`,
+    ``,
+    exp.best_code
+      ? `Current best (value ${exp.best_value}):\n--- best candidate ---\n${exp.best_code}\n--- end best candidate ---`
+      : `No baseline yet — your first candidate establishes it.`,
+    logLines.length > 0 ? `Recent runs:\n${logLines.join('\n')}` : '',
+    req.guidance.length > 0 ? `Operator guidance (follow it):\n${req.guidance.join('\n')}` : '',
+    ``,
+    `Propose ONE next candidate: a focused, single-idea change (or the initial implementation). ` +
+    `Reply with ONLY a JSON object, no code fences, in one of these shapes:`,
+    `{"description": "<one line: the idea being tested>", "code": "<complete candidate JavaScript>"}`,
+    `{"stop": true, "reason": "<why further iteration is not worthwhile>"}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const msg = await completeSimple(tedModel(), {
+    systemPrompt: 'You are an optimization researcher. Reply with only the requested JSON.',
+    messages: [{ role: 'user', content: prompt, timestamp: Date.now() }],
+  }, {
+    apiKey: openRouterKey(),
+    ...(THINKING_LEVEL !== 'off' ? { reasoning: THINKING_LEVEL } : {}),
+    maxTokens: MAX_OUTPUT_TOKENS,
+  });
+
+  const text = (Array.isArray(msg.content) ? msg.content : [])
+    .filter((b: any) => b?.type === 'text')
+    .map((b: any) => b.text ?? '')
+    .join('')
+    .trim();
+
+  const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  let parsed: any;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    const m = jsonText.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error(`proposal was not JSON: ${text.slice(0, 200)}`);
+    parsed = JSON.parse(m[0]);
+  }
+
+  if (parsed.stop) {
+    return { stop: true, reason: String(parsed.reason ?? ''), description: '', code: '', bestValue: exp.best_value };
+  }
+  if (typeof parsed.code !== 'string' || !parsed.code.trim()) {
+    throw new Error('proposal missing code');
+  }
+  return {
+    stop: false,
+    description: String(parsed.description ?? 'unnamed candidate'),
+    code: parsed.code,
+    bestValue: exp.best_value,
+  };
+}
+
+export type MeasureCandidateReq = {
+  name: string;
+  code: string;
+  samples: number;
+};
+
+/**
+ * Run candidate + measure snippet in the mcp-js sandbox N times (stateless
+ * executions so a discarded candidate leaves no residue) and collect
+ * METRIC values.
+ */
+export async function measureCandidate(req: MeasureCandidateReq): Promise<{ values: number[]; lastOutput: string }> {
+  const exp = await getExperiment(req.name);
+  if (!exp) throw new Error(`experiment not found: ${req.name}`);
+  const program = `${req.code}\n;\n${exp.measure_code}`;
+  const values: number[] = [];
+  let lastOutput = '';
+  for (let i = 0; i < req.samples; i++) {
+    heartbeat();
+    try {
+      lastOutput = await runJs(program);
+    } catch (err) {
+      lastOutput = `execution error: ${(err as Error).message}`;
+      continue;
+    }
+    const found = parseMetricValues(lastOutput, exp.metric_name);
+    if (found.length > 0) values.push(found[found.length - 1]);
+  }
+  return { values, lastOutput: lastOutput.slice(-2000) };
+}
+
+export type RecordExperimentRunReq = {
+  name: string;
+  iteration: number;
+  description: string;
+  code: string;
+  samples: number[];
+  value: number | null;
+  verdict: string;
+};
+
+export async function recordExperimentRun(req: RecordExperimentRunReq): Promise<void> {
+  await dbAppendExperimentRun(req);
+  if ((req.verdict === 'keep' || req.verdict === 'baseline') && req.value !== null) {
+    await setExperimentBest(req.name, req.value, req.code);
+  }
+}
+
+export async function finishExperiment(req: { name: string; status: ExperimentStatus }): Promise<void> {
+  await setExperimentStatus(req.name, req.status);
+}
+
+/** Post a line of text to an IRC channel via the bridge. */
+export async function ircSay(req: { channel: string; text: string }): Promise<void> {
+  await ircSayLines(req.channel, req.text);
 }
 
 const TITLE_MODEL =
