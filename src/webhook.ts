@@ -3,7 +3,12 @@ import { streamSSE } from 'hono/streaming';
 import { serve } from '@hono/node-server';
 import { Client, Connection } from '@temporalio/client';
 import { chatSession } from './workflows.js';
-import { userMessageSignal, closeSignal, experimentSteerSignal } from './signals.js';
+import {
+  userMessageSignal,
+  closeSignal,
+  experimentSteerSignal,
+  cancelTurnSignal,
+} from './signals.js';
 import {
   ensureSchema,
   getExperimentBySession,
@@ -32,6 +37,8 @@ export function makeApp(deps: {
   terminateLegacy?: (workflowId: string) => Promise<void>;
   /** Route a message to an active experiment for this session. Returns true if handled. */
   steerExperiment?: (sessionId: string, msg: string) => Promise<boolean>;
+  /** Force-stop the in-flight work for this session (chat turn or experiment). */
+  stopSession?: (sessionId: string) => Promise<void>;
 }) {
   const app = new Hono<{ Variables: Vars }>();
   const legacyCleaned = new Set<string>();
@@ -145,6 +152,16 @@ export function makeApp(deps: {
     return c.json({ ok: true });
   });
 
+  app.post('/sessions/:sessionId/stop', async (c) => {
+    const sessionId = c.req.param('sessionId');
+    try {
+      await deps.stopSession?.(sessionId);
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
   app.get('/sessions/:sessionId/stream', async (c) => {
     const userId = c.get('userId');
     const sessionId = c.req.param('sessionId');
@@ -213,6 +230,20 @@ async function main() {
         }
       }
       return true;
+    },
+    stopSession: async (sessionId) => {
+      const exp = await getExperimentBySession(sessionId).catch(() => null);
+      if (exp) {
+        await client.workflow
+          .getHandle(`auto:${exp.name}`)
+          .signal(experimentSteerSignal, 'stop')
+          .catch(() => {});
+        return;
+      }
+      await client.workflow
+        .getHandle(`${WF_PREFIX}${sessionId}`)
+        .signal(cancelTurnSignal)
+        .catch(() => {});
     },
   });
 

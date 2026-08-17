@@ -4,7 +4,12 @@ import { Worker } from '@temporalio/worker';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { chatSession } from '../workflows.js';
-import { userMessageSignal, closeSignal, transcriptQuery } from '../signals.js';
+import {
+  userMessageSignal,
+  closeSignal,
+  transcriptQuery,
+  cancelTurnSignal,
+} from '../signals.js';
 import type { LlmTurnReq, ExecuteToolReq } from '../activities.js';
 
 const workflowsPath = fileURLToPath(new URL('../workflows.ts', import.meta.url));
@@ -158,6 +163,64 @@ describe('chatSession workflow', () => {
         { role: 'user', content: 'what is 1+1?' },
         { role: 'assistant', content: 'tool said: 2' },
       ]);
+
+      await handle.signal(closeSignal);
+      await handle.result();
+    });
+  });
+
+  it('cancelTurn signal force-stops a tool loop', async () => {
+    // llmTurn always requests another tool call — an endless loop unless
+    // cancelled.
+    let calls = 0;
+    const activities = {
+      ...noopActivities,
+      llmTurn: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 100));
+        return assistantMessage('', [{ id: `tc-${calls}`, name: 'run_js', args: {} }]);
+      },
+      executeTool: async (req: ExecuteToolReq) => ({
+        role: 'toolResult' as const,
+        toolCallId: req.toolCallId,
+        toolName: req.toolName,
+        content: [{ type: 'text' as const, text: 'ok' }],
+        isError: false,
+        timestamp: Date.now(),
+      }),
+    };
+
+    const worker = await Worker.create({
+      connection: testEnv.nativeConnection,
+      taskQueue: 'test-chat',
+      workflowsPath: workflowsPath,
+      activities,
+    });
+
+    await worker.runUntil(async () => {
+      const sessionId = randomUUID();
+      const handle = await testEnv.client.workflow.start(chatSession, {
+        workflowId: `chat2:${sessionId}`,
+        taskQueue: 'test-chat',
+        args: [sessionId, []],
+      });
+
+      await handle.signal(userMessageSignal, 'go');
+      await new Promise((r) => setTimeout(r, 400));
+      await handle.signal(cancelTurnSignal);
+
+      let transcript: { role: string; content: string }[] = [];
+      for (let i = 0; i < 100; i++) {
+        transcript = await handle.query(transcriptQuery);
+        if (transcript.some((m) => m.role === 'assistant')) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+
+      expect(transcript.at(-1)).toEqual({
+        role: 'assistant',
+        content: '[turn cancelled by operator]',
+      });
+      expect(calls).toBeLessThan(20);
 
       await handle.signal(closeSignal);
       await handle.result();

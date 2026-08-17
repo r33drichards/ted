@@ -7,3 +7,6 @@ export const transcriptQuery   = defineQuery<Msg[]>('transcript');
 
 /** Steering message for an autoresearch experiment workflow. */
 export const experimentSteerSignal = defineSignal<[string]>('experimentSteer');
+
+/** Force-stop the in-flight agent turn (halts at the next activity boundary). */
+export const cancelTurnSignal = defineSignal<[]>('cancelTurn');

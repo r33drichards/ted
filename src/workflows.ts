@@ -12,6 +12,7 @@ import {
   closeSignal,
   transcriptQuery,
   experimentSteerSignal,
+  cancelTurnSignal,
 } from './signals.js';
 import { drainInbox } from './inbox.js';
 import { decideVerdict, formatRunLine, type Direction } from './experiments.js';
@@ -87,11 +88,16 @@ export async function chatSession(
   let closed = false;
   let titleGenerated = seedHistory.length > 0;
 
+  let cancelRequested = false;
+
   setHandler(userMessageSignal, (msg: string) => {
     inbox.push(msg);
   });
   setHandler(closeSignal, () => {
     closed = true;
+  });
+  setHandler(cancelTurnSignal, () => {
+    cancelRequested = true;
   });
   setHandler(transcriptQuery, () => history);
 
@@ -107,9 +113,18 @@ export async function chatSession(
 
     // Agent loop: each LLM call and each tool execution is an activity.
     let finalText = '';
+    cancelRequested = false;
     try {
       for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
         const assistant = await llmTurn({ sessionId, userId, convo });
+
+        if (cancelRequested) {
+          // Operator force-stop (,stop): drop this uncommitted step so no
+          // dangling tool call is left, and end the turn.
+          finalText = '[turn cancelled by operator]';
+          break;
+        }
+
         convo.push(assistant);
 
         const text = extractText(assistant.content);
@@ -133,6 +148,11 @@ export async function chatSession(
         );
         convo.push(...results);
         trimConvo(convo);
+
+        if (cancelRequested) {
+          finalText = '[turn cancelled by operator]';
+          break;
+        }
       }
     } catch (err) {
       // Keep the session alive on a failed turn. Drop a trailing assistant

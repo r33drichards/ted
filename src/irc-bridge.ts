@@ -37,6 +37,43 @@ export function chunkForIrc(text: string, max = 400): string[] {
   return out;
 }
 
+/**
+ * Parse a bridge admin command (default prefix ","). Returns null when the
+ * message is not a command. Commands are handled by the bridge itself and
+ * never forwarded to the agent.
+ */
+export type AdminCommand = { verb: string; rest: string };
+
+export function parseAdminCommand(msg: string, prefix = ','): AdminCommand | null {
+  if (!msg.startsWith(prefix) || msg.length <= prefix.length) return null;
+  const body = msg.slice(prefix.length).trim();
+  if (!body) return null;
+  const sp = body.indexOf(' ');
+  const verb = (sp === -1 ? body : body.slice(0, sp)).toLowerCase();
+  const rest = sp === -1 ? '' : body.slice(sp + 1).trim();
+  return { verb, rest };
+}
+
+/** Normalize a raw-command payload: accept "/join #x" as "JOIN #x". */
+export function normalizeRawLine(rest: string): string {
+  let line = rest.trim();
+  if (line.startsWith('/')) {
+    line = line.slice(1);
+    const sp = line.indexOf(' ');
+    const verb = sp === -1 ? line : line.slice(0, sp);
+    line = verb.toUpperCase() + (sp === -1 ? '' : line.slice(sp));
+  }
+  return line;
+}
+
+/** Split ",join #a,#b #c" style channel lists. */
+export function parseChannelList(rest: string): string[] {
+  return rest
+    .split(/[,\s]+/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 1 && (c.startsWith('#') || c.startsWith('&')));
+}
+
 // ---------- runtime glue ----------
 
 type Config = {
@@ -308,6 +345,53 @@ async function main() {
     },
   );
 
+  // Admin commands handled by the bridge itself (never forwarded to the
+  // agent), so they work even while the agent is mid-turn.
+  async function handleAdminCommand(channel: string, cmd: AdminCommand): Promise<void> {
+    const say = (text: string) => client.say(channel, `[admin] ${text}`);
+    switch (cmd.verb) {
+      case 'join': {
+        const channels = parseChannelList(cmd.rest);
+        if (channels.length === 0) return say('usage: ,join #chan[,#chan2 ...]');
+        for (const ch of channels) client.join(ch);
+        return say(`joining ${channels.join(', ')}`);
+      }
+      case 'part': {
+        const channels = parseChannelList(cmd.rest);
+        if (channels.length === 0) return say('usage: ,part #chan[,#chan2 ...]');
+        for (const ch of channels) client.part(ch);
+        return say(`parting ${channels.join(', ')}`);
+      }
+      case 'send': {
+        const line = normalizeRawLine(cmd.rest);
+        if (!line) return say('usage: ,send <raw irc line> (e.g. ,send /join #chan)');
+        try {
+          client.raw(line);
+          return say(`sent: ${line}`);
+        } catch (err) {
+          return say(`send failed: ${(err as Error).message}`);
+        }
+      }
+      case 'stop':
+      case 'cancel': {
+        try {
+          const res = await fetch(
+            `${cfg.webhookUrl}/sessions/${encodeURIComponent(sessionForChannel(channel))}/stop`,
+            { method: 'POST', headers: { 'X-User-ID': cfg.userId } },
+          );
+          if (!res.ok) return say(`stop failed: webhook ${res.status}`);
+          return say('stop requested — the turn halts at the next step boundary');
+        } catch (err) {
+          return say(`stop failed: ${(err as Error).message}`);
+        }
+      }
+      case 'help':
+        return say(',stop | ,join #a,#b | ,part #a | ,send <raw or /cmd> | ,help');
+      default:
+        return say(`unknown command "${cmd.verb}" — try ,help`);
+    }
+  }
+
   client.on(
     'privmsg',
     (event: { target: string; nick: string; message: string }) => {
@@ -315,6 +399,13 @@ async function main() {
       // Ignore own messages and any stale instances with the same base nick
       const baseNick = (process.env.IRC_NICK ?? 'ted-bot');
       if (event.nick.startsWith(baseNick)) return;
+      const cmd = parseAdminCommand(event.message);
+      if (cmd) {
+        void handleAdminCommand(event.target, cmd).catch((err) =>
+          console.error('[irc] admin command failed:', (err as Error).message),
+        );
+        return;
+      }
       const payload = `${event.nick}: ${event.message}`;
       postToWebhook(
         cfg,

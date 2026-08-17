@@ -10,7 +10,7 @@ Durable chat agent powered by the pi agent harness (@earendil-works/pi-coding-ag
 - `src/experiments.ts` + `autoresearch` workflow — pi-autoresearch pattern: per-experiment workflow (`auto:<name>`) proposes candidate JS (LLM activity), measures it in the sandbox, keeps improvements (median/MAD verdicts); progress + steering via IRC channel `#auto-<name>` (webhook routes that channel's messages to the experiment's steer signal, docs/plans/2026-08-17-autoresearch-irc-design.md)
 - `src/workflows.ts` — Temporal chatSession workflow
 - `src/webhook.ts` — Hono HTTP API (message ingestion, sessions, SSE streaming)
-- `src/irc-bridge.ts` — IRC bridge (InspIRCd on Railway private network)
+- `src/irc-bridge.ts` — IRC bridge (InspIRCd on Railway private network). Admin commands with `,` prefix handled by the bridge itself, never the agent: `,stop`/`,cancel` (force-stop the channel's in-flight turn or experiment via `POST /sessions/:id/stop` → cancelTurn/steer signal), `,join #a,#b`, `,part #a`, `,send <raw or /cmd>`, `,help`
 - `src/db.ts` — Postgres schema + CRUD (messages, sessions, mcp_servers, memories)
 - `src/publish.ts` — Redis Streams for SSE deltas (delta, thinking, tool_call, turn_end)
 - `.claude/skills/` — Agent skills (auto-discovered, self-editable)
