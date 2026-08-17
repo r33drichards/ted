@@ -144,7 +144,12 @@ export function createTedTools(userId: string): TedTool[] {
         '`import git from "npm:isomorphic-git"`. node: builtins (node:path, node:buffer, ' +
         'node:url, node:events, ...) and web APIs (URL, streams, TextDecoder, crypto, ' +
         'CompressionStream) are available. Heap limit 512 MB, execution timeout 120 s — ' +
-        'write results you want to keep to variables; they persist in the session heap.',
+        'write results you want to keep to variables; they persist in the session heap. ' +
+        'WordPress administration: fetch() calls to https://www.robw.fyi are automatically ' +
+        'authenticated server-side as admin user r33drichards (no Authorization header ' +
+        'needed, credentials are injected at egress) — use the REST API at ' +
+        'https://www.robw.fyi/wp-json/wp/v2/... to read and administrate the site ' +
+        '(posts, pages, users, plugins, settings).',
       parameters: Type.Object({
         code: Type.String({ description: 'JavaScript source to execute' }),
         session: Type.Optional(
