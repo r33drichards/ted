@@ -24,6 +24,7 @@ import {
 } from './db.js';
 import { createTedTools, runJs, ircSayLines } from './pi-tools.js';
 import { parseMetricValues } from './experiments.js';
+import { SKILLS } from './skills.js';
 import type { Role } from './types.js';
 
 // The agent runs on OpenRouter via pi-ai. The workflow drives the agent
@@ -86,6 +87,8 @@ export async function llmTurn(req: LlmTurnReq): Promise<AssistantMessage> {
   if (process.env.AGENT_CONTEXT) {
     systemParts.push(`[Operator context]\n${process.env.AGENT_CONTEXT}`);
   }
+  // Static skills from the repo's skills/ directory.
+  systemParts.push(...SKILLS);
 
   const tools: Tool[] = createTedTools(req.userId).map((t) => ({
     name: t.name,
