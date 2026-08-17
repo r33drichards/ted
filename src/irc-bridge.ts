@@ -306,6 +306,21 @@ async function main() {
         client.join(ch);
       }
     }
+    // Join the operator-managed autojoin list (stored in Postgres,
+    // served by the webhook, CRUD'd via the agent's channels_* tools).
+    void fetch(`${cfg.webhookUrl}/autojoin`, { headers: { 'X-User-ID': cfg.userId } })
+      .then((r) => (r.ok ? r.json() : { channels: [] }))
+      .then((body: any) => {
+        for (const ch of body?.channels ?? []) {
+          if (typeof ch === 'string' && !joined.has(ch)) {
+            console.log('[irc] autojoin', ch);
+            client.join(ch);
+          }
+        }
+      })
+      .catch((err) =>
+        console.error('[irc] autojoin fetch failed:', (err as Error).message),
+      );
   });
 
   client.on('join', (event: { channel: string; nick: string }) => {

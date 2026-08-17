@@ -12,6 +12,7 @@ import {
 import {
   ensureSchema,
   getExperimentBySession,
+  listAutojoinChannels,
   getMessages,
   getSessions,
   createSession,
@@ -150,6 +151,13 @@ export function makeApp(deps: {
     const ok = await deleteSession(sessionId, userId);
     if (!ok) return c.json({ error: 'not found' }, 404);
     return c.json({ ok: true });
+  });
+
+  // Channels the bridge should join on connect (managed via agent tools).
+  app.get('/autojoin', async (c) => {
+    const userId = c.get('userId');
+    const channels = await listAutojoinChannels(userId);
+    return c.json({ channels });
   });
 
   app.post('/sessions/:sessionId/stop', async (c) => {

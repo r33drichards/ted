@@ -7,6 +7,7 @@
  * activity. Each tool execution is its own Temporal activity.
  */
 import { Type, type TSchema } from '@earendil-works/pi-ai';
+import { ScheduleOverlapPolicy } from '@temporalio/client';
 import {
   setMemory,
   getMemory,
@@ -19,10 +20,25 @@ import {
   listExperimentRuns,
   setExperimentStatus,
   ExperimentExistsError,
+  listAutojoinChannels,
+  addAutojoinChannel,
+  removeAutojoinChannel,
   type MemoryTier,
 } from './db.js';
 import { getTemporalClient, TASK_QUEUE } from './temporal-client.js';
 import { experimentSteerSignal } from './signals.js';
+
+/** '#chan' → 'irc-chan' (the bridge's session naming). */
+export function channelToSession(channel: string): string {
+  return `irc-${channel.replace(/^[#&]/, '')}`;
+}
+
+const CHANNEL_RE = /^[#&][^\s,]{1,49}$/;
+
+/** Cron expression (with year field) that fires once at the given UTC time. */
+export function oneShotCron(d: Date): string {
+  return `${d.getUTCMinutes()} ${d.getUTCHours()} ${d.getUTCDate()} ${d.getUTCMonth() + 1} * ${d.getUTCFullYear()}`;
+}
 
 export type TedTool = {
   name: string;
@@ -342,6 +358,166 @@ export function createTedTools(userId: string): TedTool[] {
             .map((e) => `${e.name} [${e.status}] best ${e.best_value ?? 'n/a'}${e.metric_unit} — ${e.goal}`)
             .join('\n'),
         };
+      },
+    },
+
+    {
+      name: 'schedule_create',
+      description:
+        'Create a recurring or one-shot scheduled prompt that fires into a channel’s chat ' +
+        'session via a Temporal Schedule. Use cron for recurring (standard cron expression, UTC) ' +
+        'or at for a one-time fire (ISO 8601 timestamp). When it fires, the prompt arrives as a ' +
+        'new message ("scheduler: <prompt>") in that channel’s session and the agent acts on it.',
+      parameters: Type.Object({
+        id: Type.String({ description: 'Unique schedule identifier (e.g. "morning-report")' }),
+        channel: Type.String({ description: 'Target IRC channel whose session receives the prompt (e.g. "#ted")' }),
+        prompt: Type.String({ description: 'Prompt text sent when the schedule fires' }),
+        cron: Type.Optional(Type.String({ description: 'Cron expression for recurring (e.g. "0 9 * * *"), UTC' })),
+        at: Type.Optional(Type.String({ description: 'ISO 8601 timestamp for a one-shot fire' })),
+      }),
+      execute: async (args) => {
+        const channel = String(args.channel ?? '').trim();
+        if (!CHANNEL_RE.test(channel)) {
+          return { text: `Invalid channel "${channel}".`, isError: true };
+        }
+        if (!args.cron && !args.at) {
+          return { text: 'Provide either cron (recurring) or at (one-shot).', isError: true };
+        }
+        const spec: any = {};
+        let kind: string;
+        if (args.cron) {
+          spec.cronExpressions = [String(args.cron)];
+          kind = `recurring (${args.cron})`;
+        } else {
+          const d = new Date(String(args.at));
+          if (isNaN(d.getTime())) return { text: `Invalid timestamp: "${args.at}"`, isError: true };
+          spec.cronExpressions = [oneShotCron(d)];
+          kind = `one-shot (${d.toISOString()})`;
+        }
+        try {
+          const client = await getTemporalClient();
+          const handle = await client.schedule.create({
+            scheduleId: String(args.id),
+            spec,
+            action: {
+              type: 'startWorkflow' as const,
+              workflowType: 'scheduledPrompt',
+              taskQueue: TASK_QUEUE,
+              args: [channelToSession(channel), userId, String(args.prompt)],
+            },
+            policies: { overlap: ScheduleOverlapPolicy.SKIP },
+            ...(args.at ? { state: { remainingActions: 1 } } : {}),
+          });
+          return {
+            text:
+              `Created schedule "${handle.scheduleId}" — ${kind}\n` +
+              `  target: ${channel}\n  prompt: ${args.prompt}`,
+          };
+        } catch (err) {
+          return { text: `Failed to create schedule: ${(err as Error).message}`, isError: true };
+        }
+      },
+    },
+
+    {
+      name: 'schedule_list',
+      description: 'List scheduled prompts with paused state and next fire times.',
+      parameters: Type.Object({}),
+      execute: async () => {
+        try {
+          const client = await getTemporalClient();
+          const lines: string[] = [];
+          for await (const s of client.schedule.list()) {
+            const paused = s.state.paused ? ' [PAUSED]' : '';
+            const next = (s.info.nextActionTimes ?? [])
+              .slice(0, 3)
+              .map((d: Date) => d.toISOString())
+              .join(', ');
+            lines.push(`${s.scheduleId}${paused}${next ? ` — next: ${next}` : ''}`);
+          }
+          return { text: lines.length > 0 ? lines.join('\n') : 'No schedules.' };
+        } catch (err) {
+          return { text: `Failed to list schedules: ${(err as Error).message}`, isError: true };
+        }
+      },
+    },
+
+    {
+      name: 'schedule_delete',
+      description: 'Delete a scheduled prompt by ID.',
+      parameters: Type.Object({ id: Type.String() }),
+      execute: async (args) => {
+        try {
+          const client = await getTemporalClient();
+          await client.schedule.getHandle(String(args.id)).delete();
+          return { text: `Deleted schedule "${args.id}".` };
+        } catch (err) {
+          return { text: `Failed to delete schedule: ${(err as Error).message}`, isError: true };
+        }
+      },
+    },
+
+    {
+      name: 'schedule_trigger',
+      description: 'Manually fire a scheduled prompt immediately.',
+      parameters: Type.Object({ id: Type.String() }),
+      execute: async (args) => {
+        try {
+          const client = await getTemporalClient();
+          await client.schedule.getHandle(String(args.id)).trigger();
+          return { text: `Triggered schedule "${args.id}" — fires now.` };
+        } catch (err) {
+          return { text: `Failed to trigger schedule: ${(err as Error).message}`, isError: true };
+        }
+      },
+    },
+
+    {
+      name: 'channels_list',
+      description: 'List the channels the IRC bridge auto-joins on connect.',
+      parameters: Type.Object({}),
+      execute: async () => {
+        const channels = await listAutojoinChannels(userId);
+        return { text: channels.length > 0 ? channels.join(', ') : 'No autojoin channels configured.' };
+      },
+    },
+
+    {
+      name: 'channels_add',
+      description:
+        'Add a channel to the autojoin list (joined on every bridge connect) and join it now.',
+      parameters: Type.Object({
+        channel: Type.String({ description: 'Channel name, e.g. "#research"' }),
+      }),
+      execute: async (args) => {
+        const channel = String(args.channel ?? '').trim();
+        if (!CHANNEL_RE.test(channel)) return { text: `Invalid channel "${channel}".`, isError: true };
+        await addAutojoinChannel(userId, channel);
+        try {
+          await ircRawLine(`JOIN ${channel}`);
+          return { text: `Added ${channel} to autojoin and joined it.` };
+        } catch (err) {
+          return { text: `Added ${channel} to autojoin (join failed: ${(err as Error).message}).` };
+        }
+      },
+    },
+
+    {
+      name: 'channels_remove',
+      description: 'Remove a channel from the autojoin list and part it now.',
+      parameters: Type.Object({
+        channel: Type.String({ description: 'Channel name, e.g. "#research"' }),
+      }),
+      execute: async (args) => {
+        const channel = String(args.channel ?? '').trim();
+        const removed = await removeAutojoinChannel(userId, channel);
+        if (!removed) return { text: `${channel} was not on the autojoin list.` };
+        try {
+          await ircRawLine(`PART ${channel} :removed from autojoin`);
+        } catch {
+          // bridge unreachable — the DB change still sticks
+        }
+        return { text: `Removed ${channel} from autojoin and parted it.` };
       },
     },
 

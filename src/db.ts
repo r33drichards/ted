@@ -100,6 +100,12 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS experiment_runs_name_idx ON experiment_runs (experiment_name, id DESC);
+
+CREATE TABLE IF NOT EXISTS autojoin_channels (
+  channel    TEXT        PRIMARY KEY,
+  user_id    TEXT        NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `;
 
 export async function ensureSchema(): Promise<void> {
@@ -545,6 +551,40 @@ export async function searchMemories(
     [userId, pattern],
   );
   return rows;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Autojoin channels                                                 */
+/* ------------------------------------------------------------------ */
+
+export async function listAutojoinChannels(userId: string): Promise<string[]> {
+  const { rows } = await getPool().query<{ channel: string }>(
+    'SELECT channel FROM autojoin_channels WHERE user_id = $1 ORDER BY channel',
+    [userId],
+  );
+  return rows.map((r) => r.channel);
+}
+
+export async function addAutojoinChannel(
+  userId: string,
+  channel: string,
+): Promise<void> {
+  await getPool().query(
+    `INSERT INTO autojoin_channels (channel, user_id)
+     VALUES ($1, $2) ON CONFLICT (channel) DO NOTHING`,
+    [channel, userId],
+  );
+}
+
+export async function removeAutojoinChannel(
+  userId: string,
+  channel: string,
+): Promise<boolean> {
+  const res = await getPool().query(
+    'DELETE FROM autojoin_channels WHERE channel = $1 AND user_id = $2',
+    [channel, userId],
+  );
+  return (res.rowCount ?? 0) > 0;
 }
 
 /* ------------------------------------------------------------------ */

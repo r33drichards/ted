@@ -344,6 +344,47 @@ export async function ircSay(req: { channel: string; text: string }): Promise<vo
   await ircSayLines(req.channel, req.text);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Scheduled prompts (Temporal Schedules → scheduledPrompt workflow) */
+/* ------------------------------------------------------------------ */
+
+export type FireScheduledPromptReq = {
+  sessionId: string;
+  userId: string;
+  prompt: string;
+};
+
+/**
+ * Fire a scheduled prompt into an existing chat session by POSTing to the
+ * local webhook /message endpoint — the same path the IRC bridge uses, so
+ * session creation, experiment routing, and workflow signaling all reuse
+ * the existing logic. Echoes the prompt to the session's IRC channel first
+ * so the trigger is visible.
+ */
+export async function fireScheduledPrompt(req: FireScheduledPromptReq): Promise<void> {
+  const channel = req.sessionId.startsWith('irc-') ? `#${req.sessionId.slice(4)}` : null;
+  if (channel) {
+    await ircSayLines(channel, `[scheduled] ${req.prompt}`).catch(() => {});
+  }
+
+  const webhookUrl = process.env.WEBHOOK_URL ?? `http://localhost:${process.env.WEBHOOK_PORT ?? 8787}`;
+  const resp = await fetch(`${webhookUrl}/message`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'X-User-ID': req.userId,
+    },
+    body: JSON.stringify({
+      sessionId: req.sessionId,
+      msg: `scheduler: ${req.prompt}`,
+    }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`webhook /message returned ${resp.status}: ${text}`);
+  }
+}
+
 const TITLE_MODEL =
   process.env.OPENROUTER_TITLE_MODEL ?? process.env.ANTHROPIC_TITLE_MODEL ?? MODEL_ID;
 

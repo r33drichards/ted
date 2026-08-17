@@ -59,6 +59,14 @@ describe('decideVerdict', () => {
   });
 });
 
+describe('schedule helpers', () => {
+  it('oneShotCron encodes a UTC instant with year', async () => {
+    const { oneShotCron, channelToSession } = await import('../pi-tools.js');
+    expect(oneShotCron(new Date('2026-04-28T15:07:00Z'))).toBe('7 15 28 4 * 2026');
+    expect(channelToSession('#research')).toBe('irc-research');
+  });
+});
+
 describe('formatRunLine', () => {
   it('formats a keep line', () => {
     const line = formatRunLine(12, 'keep', 143, 143, 'ms', 'memoize inner loop');

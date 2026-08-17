@@ -188,6 +188,28 @@ export async function chatSession(
 }
 
 /* ------------------------------------------------------------------ */
+/*  Scheduled prompts                                                 */
+/* ------------------------------------------------------------------ */
+
+const { fireScheduledPrompt } = proxyActivities<typeof activities>({
+  startToCloseTimeout: '30 seconds',
+  retry: { maximumAttempts: 2 },
+});
+
+/**
+ * Short-lived workflow started by Temporal Schedules: injects a prompt
+ * into an existing chat session via the webhook, exactly like the IRC
+ * bridge does. The chatSession workflow handles the rest.
+ */
+export async function scheduledPrompt(
+  sessionId: string,
+  userId: string,
+  prompt: string,
+): Promise<void> {
+  await fireScheduledPrompt({ sessionId, userId, prompt });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Autoresearch: autonomous experiment loop                          */
 /* ------------------------------------------------------------------ */
 

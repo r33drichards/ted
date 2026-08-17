@@ -6,7 +6,7 @@ Durable chat agent powered by the pi agent harness (@earendil-works/pi-coding-ag
 
 - `src/activities.ts` — Temporal activities: `llmTurn` (one pi-ai model call against OpenRouter, streams deltas to Redis), `executeTool` (one tool call), `endTurn`, `persistTurn`, `generateTitle`
 - `src/workflows.ts` — chatSession workflow owns the agent loop: llmTurn → executeTool per tool call (parallel) → repeat; the LLM conversation (`convo`) is workflow state, trimmed and carried through continue-as-new
-- `src/pi-tools.ts` — Tool defs (schema + execute): `run_js` (mcp-js REST sidecar), memory CRUD (working/short_term/long_term), `irc_raw`, `experiment_start/stop/status`
+- `src/pi-tools.ts` — Tool defs (schema + execute): `run_js` (mcp-js REST sidecar), memory CRUD (working/short_term/long_term), `irc_raw`, `experiment_start/stop/status`, `schedule_create/list/delete/trigger` (Temporal Schedules → `scheduledPrompt` workflow → webhook `/message`, prompt arrives as "scheduler: …" in the target channel's session), `channels_add/remove/list` (Postgres autojoin list; the bridge fetches `GET /autojoin` on connect and joins them)
 - `src/experiments.ts` + `autoresearch` workflow — pi-autoresearch pattern: per-experiment workflow (`auto:<name>`) proposes candidate JS (LLM activity), measures it in the sandbox, keeps improvements (median/MAD verdicts); progress + steering via IRC channel `#auto-<name>` (webhook routes that channel's messages to the experiment's steer signal, docs/plans/2026-08-17-autoresearch-irc-design.md)
 - `src/workflows.ts` — Temporal chatSession workflow
 - `src/webhook.ts` — Hono HTTP API (message ingestion, sessions, SSE streaming)
