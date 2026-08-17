@@ -1,12 +1,14 @@
 import { heartbeat } from '@temporalio/activity';
-import { existsSync, mkdirSync } from 'fs';
-import {
-  createAgentSession,
-  DefaultResourceLoader,
-  ModelRuntime,
-  SessionManager,
-} from '@earendil-works/pi-coding-agent';
-import type { Model } from '@earendil-works/pi-ai';
+import { streamSimple } from '@earendil-works/pi-ai/compat';
+import type {
+  AssistantMessage,
+  Context,
+  Message,
+  Model,
+  ThinkingLevel,
+  Tool,
+  ToolResultMessage,
+} from '@earendil-works/pi-ai';
 import { publishDelta, publishThinking, publishToolCall, publishTurnEnd } from './publish.js';
 import {
   appendMessage,
@@ -15,20 +17,19 @@ import {
   loadMemoryContext,
 } from './db.js';
 import { createTedTools } from './pi-tools.js';
-import type { Role, StreamReq } from './types.js';
+import type { Role } from './types.js';
 
-// The agent runs on OpenRouter via the pi agent harness (no Claude Code
-// binary, no Anthropic-compat shim).
+// The agent runs on OpenRouter via pi-ai. The workflow drives the agent
+// loop: each LLM call (llmTurn) and each tool execution (executeTool) is
+// its own Temporal activity.
 const MODEL_ID = process.env.OPENROUTER_MODEL ?? process.env.ANTHROPIC_MODEL ?? 'z-ai/glm-5.2';
-const THINKING_LEVEL = (process.env.PI_THINKING_LEVEL ?? 'medium') as any;
+const THINKING_LEVEL = (process.env.PI_THINKING_LEVEL ?? 'medium') as ThinkingLevel | 'off';
+const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS ?? 64_000);
+const TOOL_RESULT_MAX_CHARS = Number(process.env.TOOL_RESULT_MAX_CHARS ?? 30_000);
 
 function openRouterKey(): string {
   return process.env.OR_API_KEY ?? process.env.OPENROUTER_API_KEY ?? '';
 }
-
-const VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH ?? '/tmp';
-const PI_DIR = process.env.PI_AGENT_DIR ?? `${VOLUME}/pi-agent`;
-const SESSION_DIR = `${PI_DIR}/sessions`;
 
 function tedModel(): Model<'openai-completions'> {
   return {
@@ -41,25 +42,24 @@ function tedModel(): Model<'openai-completions'> {
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 200_000,
-    maxTokens: 64_000,
+    maxTokens: MAX_OUTPUT_TOKENS,
   };
 }
 
-/**
- * Stream an assistant turn using the pi agent harness against OpenRouter.
- *
- * Multi-turn context comes from pi's persistent session files (on the
- * Railway volume); `sdkSessionId` carries the session file path across
- * turns and continue-as-new.
- *
- * Returns { text, sdkSessionId } so the workflow can track the session.
- */
-export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkSessionId: string }> {
-  const memoryCtx = await loadMemoryContext(req.userId);
-  mkdirSync(SESSION_DIR, { recursive: true });
+export type LlmTurnReq = {
+  sessionId: string;
+  userId: string;
+  convo: Message[];
+};
 
-  const modelRuntime = await ModelRuntime.create({ authPath: `${PI_DIR}/auth.json` });
-  await modelRuntime.setRuntimeApiKey('openrouter', openRouterKey());
+/**
+ * One model call: stream a single assistant message (text, thinking, and
+ * tool-call requests) and publish deltas to Redis as they arrive. Tool
+ * calls are NOT executed here — the workflow schedules executeTool
+ * activities for them and calls llmTurn again with the results.
+ */
+export async function llmTurn(req: LlmTurnReq): Promise<AssistantMessage> {
+  const memoryCtx = await loadMemoryContext(req.userId);
 
   const systemParts: string[] = [
     'You are ted, a chat agent bridged into IRC. Keep replies short and IRC-friendly: ' +
@@ -68,88 +68,100 @@ export async function streamClaude(req: StreamReq): Promise<{ text: string; sdkS
     'only way to compute things. You can persist notes with the memory_* tools, and send raw ' +
     'IRC commands via irc_raw (e.g. "JOIN #channel", "PRIVMSG #channel :text"). After a JOIN ' +
     'the bridge starts a per-channel session and future messages from that channel arrive as new turns.',
-    'Always finish your turn with a message to the user summarizing what you did or found — ' +
-    'never end a turn inside reasoning.',
+    'Always finish with a message to the user summarizing what you did or found — never end ' +
+    'a turn inside reasoning.',
   ];
   if (memoryCtx) systemParts.push(memoryCtx);
 
-  const loader = new DefaultResourceLoader({
-    cwd: '/app',
-    agentDir: PI_DIR,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+  const tools: Tool[] = createTedTools(req.userId).map((t) => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+  }));
+
+  const context: Context = {
     systemPrompt: systemParts.join('\n\n'),
-  });
-  await loader.reload();
+    messages: req.convo,
+    tools,
+  };
 
-  // Resume the previous pi session file when it still exists.
-  let sessionManager: SessionManager;
-  const prior = req.sdkSessionId ?? '';
-  if (prior && existsSync(prior)) {
-    try {
-      sessionManager = SessionManager.open(prior, SESSION_DIR);
-    } catch (err) {
-      console.log(`[agent] failed to open session ${prior} (${(err as Error).message}), starting fresh`);
-      sessionManager = SessionManager.create('/app', SESSION_DIR);
-    }
-  } else {
-    if (prior) console.log(`[agent] stale session ${prior}, starting fresh`);
-    sessionManager = SessionManager.create('/app', SESSION_DIR);
-  }
-
-  const { session } = await createAgentSession({
-    cwd: '/app',
-    agentDir: PI_DIR,
-    modelRuntime,
-    model: tedModel(),
-    thinkingLevel: THINKING_LEVEL,
-    noTools: 'builtin',
-    customTools: createTedTools(req.userId),
-    resourceLoader: loader,
-    sessionManager,
+  const stream = streamSimple(tedModel(), context, {
+    apiKey: openRouterKey(),
+    ...(THINKING_LEVEL !== 'off' ? { reasoning: THINKING_LEVEL } : {}),
+    maxTokens: MAX_OUTPUT_TOKENS,
   });
 
-  const lastUserMsg = req.history.filter((m) => m.role === 'user').pop();
-  const prompt = lastUserMsg?.content ?? '';
-
-  let lastAssistantText = '';
-  const unsubscribe = session.subscribe((event) => {
+  let final: AssistantMessage | undefined;
+  for await (const ev of stream) {
     heartbeat();
-    if (event.type === 'message_update') {
-      const ev = event.assistantMessageEvent;
-      if (ev.type === 'text_delta' && ev.delta) {
-        void publishDelta(req.sessionId, ev.delta).catch(() => {});
-      } else if (ev.type === 'thinking_delta' && ev.delta) {
-        void publishThinking(req.sessionId, ev.delta).catch(() => {});
-      }
-    } else if (event.type === 'tool_execution_start') {
-      void publishToolCall(req.sessionId, event.toolName).catch(() => {});
-    } else if (event.type === 'turn_end') {
-      const msg = event.message as any;
-      if (msg?.role === 'assistant' && Array.isArray(msg.content)) {
-        const text = msg.content
-          .filter((b: any) => b?.type === 'text')
-          .map((b: any) => b.text ?? '')
-          .join('');
-        if (text.trim()) lastAssistantText = text;
-      }
+    if (ev.type === 'text_delta' && ev.delta) {
+      void publishDelta(req.sessionId, ev.delta).catch(() => {});
+    } else if (ev.type === 'thinking_delta' && ev.delta) {
+      void publishThinking(req.sessionId, ev.delta).catch(() => {});
+    } else if (ev.type === 'toolcall_end') {
+      void publishToolCall(req.sessionId, ev.toolCall.name).catch(() => {});
+    } else if (ev.type === 'done') {
+      final = ev.message;
+    } else if (ev.type === 'error') {
+      final = ev.error;
     }
-  });
-
-  let sdkSessionId = '';
-  try {
-    await session.prompt(prompt);
-    sdkSessionId = session.sessionFile ?? '';
-  } finally {
-    unsubscribe();
-    session.dispose();
-    await publishTurnEnd(req.sessionId);
   }
 
-  return { text: lastAssistantText, sdkSessionId };
+  if (!final) throw new Error('LLM stream ended without a final message');
+  if (final.stopReason === 'error' || final.stopReason === 'aborted') {
+    throw new Error(`LLM turn failed: ${final.errorMessage ?? final.stopReason}`);
+  }
+  return final;
+}
+
+export type ExecuteToolReq = {
+  sessionId: string;
+  userId: string;
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+};
+
+/**
+ * Execute a single tool call as its own Temporal activity so every tool
+ * invocation is durable, retryable, and visible in the workflow history.
+ */
+export async function executeTool(req: ExecuteToolReq): Promise<ToolResultMessage> {
+  const tool = createTedTools(req.userId).find((t) => t.name === req.toolName);
+
+  let text: string;
+  let isError = false;
+  if (!tool) {
+    text = `Unknown tool: ${req.toolName}`;
+    isError = true;
+  } else {
+    try {
+      const result = await tool.execute(req.args ?? {});
+      text = result.text;
+      isError = result.isError ?? false;
+    } catch (err) {
+      text = `Tool ${req.toolName} failed: ${(err as Error).message}`;
+      isError = true;
+    }
+  }
+
+  if (text.length > TOOL_RESULT_MAX_CHARS) {
+    text = `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n… (truncated ${text.length - TOOL_RESULT_MAX_CHARS} chars)`;
+  }
+
+  return {
+    role: 'toolResult',
+    toolCallId: req.toolCallId,
+    toolName: req.toolName,
+    content: [{ type: 'text', text }],
+    isError,
+    timestamp: Date.now(),
+  };
+}
+
+/** Signal end-of-turn to stream consumers (the IRC bridge flushes on this). */
+export async function endTurn(req: { sessionId: string }): Promise<void> {
+  await publishTurnEnd(req.sessionId);
 }
 
 export type PersistTurnReq = {

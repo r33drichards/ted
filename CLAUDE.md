@@ -4,8 +4,9 @@ Durable chat agent powered by the pi agent harness (@earendil-works/pi-coding-ag
 
 ## Architecture
 
-- `src/activities.ts` — Temporal activities: `streamClaude` (pi agent session against OpenRouter), `persistTurn`, `generateTitle`
-- `src/pi-tools.ts` — Custom pi tools: `run_js` (mcp-js REST sidecar), memory CRUD (working/short_term/long_term), `irc_raw`
+- `src/activities.ts` — Temporal activities: `llmTurn` (one pi-ai model call against OpenRouter, streams deltas to Redis), `executeTool` (one tool call), `endTurn`, `persistTurn`, `generateTitle`
+- `src/workflows.ts` — chatSession workflow owns the agent loop: llmTurn → executeTool per tool call (parallel) → repeat; the LLM conversation (`convo`) is workflow state, trimmed and carried through continue-as-new
+- `src/pi-tools.ts` — Tool defs (schema + execute): `run_js` (mcp-js REST sidecar), memory CRUD (working/short_term/long_term), `irc_raw`
 - `src/workflows.ts` — Temporal chatSession workflow
 - `src/webhook.ts` — Hono HTTP API (message ingestion, sessions, SSE streaming)
 - `src/irc-bridge.ts` — IRC bridge (InspIRCd on Railway private network)
@@ -15,12 +16,12 @@ Durable chat agent powered by the pi agent harness (@earendil-works/pi-coding-ag
 
 ## Agent Capabilities
 
-The agent runs on pi (`createAgentSession`) with built-in coding tools disabled and only these custom tools:
+Every LLM call and every tool call is a Temporal activity — durable, retryable, and visible in workflow history. Tools:
 - `run_js` — sandboxed V8 execution via the mcp-js REST sidecar (`POST /api/exec` on mcp-js-p1ze.railway.internal:8080)
 - `memory_set/get/delete/list/search` — Postgres-backed memory tiers
 - `irc_raw` — raw IRC commands via the bridge's HTTP endpoint
 
-Model comes from `OPENROUTER_MODEL` (fallback `ANTHROPIC_MODEL`, default `z-ai/glm-5.2`), key from `OR_API_KEY`, thinking level from `PI_THINKING_LEVEL` (default `medium`). Pi session files live on the Railway volume (`RAILWAY_VOLUME_MOUNT_PATH/pi-agent/sessions`); the workflow's `sdkSessionId` is the session file path.
+Model comes from `OPENROUTER_MODEL` (fallback `ANTHROPIC_MODEL`, default `z-ai/glm-5.2`), key from `OR_API_KEY`, thinking level from `PI_THINKING_LEVEL` (default `medium`, `off` to disable).
 
 ## E2E Testing
 
@@ -32,15 +33,4 @@ node e2e/irc-e2e.mjs [--message "text"] [--timeout 90]
 
 Push to master. Railway auto-deploys `ted` and `ted-irc-bridge`.
 
-After workflow-shape changes, terminate the old workflow:
-```
-railway ssh -s ted -- 'node -e "
-const { Connection, Client } = require(\"@temporalio/client\");
-(async () => {
-  const conn = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS });
-  const client = new Client({ connection: conn });
-  await client.workflow.getHandle(\"chat:irc-ted\").terminate(\"deploy reset\");
-  process.exit(0);
-})();
-"'
-```
+Workflow IDs are `chat2:<sessionId>`. After a workflow-shape change, bump `WF_PREFIX` in `src/webhook.ts` — the webhook lazily terminates the previous-prefix workflow for a session when its next message arrives, so no manual `railway ssh` terminate is needed.

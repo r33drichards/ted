@@ -18,12 +18,20 @@ import { subscribeDeltas } from './publish.js';
 
 type Vars = { userId: string };
 
+// Workflow ID prefix. Bumped from `chat:` when the agent loop moved into
+// the workflow (per-tool-call activities) — a workflow-shape change that
+// old running histories can't replay.
+export const WF_PREFIX = 'chat2:';
+const LEGACY_WF_PREFIX = 'chat:';
+
 export function makeApp(deps: {
   signalWithStart: (wf: typeof chatSession, opts: any) => Promise<any>;
   taskQueue: string;
   signalClose?: (workflowId: string) => Promise<void>;
+  terminateLegacy?: (workflowId: string) => Promise<void>;
 }) {
   const app = new Hono<{ Variables: Vars }>();
+  const legacyCleaned = new Set<string>();
 
   app.use('*', async (c, next) => {
     const userId = c.req.header('X-User-ID');
@@ -56,8 +64,14 @@ export function makeApp(deps: {
       }
     }
 
+    // Best-effort: terminate the pre-refactor workflow for this session once.
+    if (!legacyCleaned.has(body.sessionId)) {
+      legacyCleaned.add(body.sessionId);
+      deps.terminateLegacy?.(`${LEGACY_WF_PREFIX}${body.sessionId}`).catch(() => {});
+    }
+
     await deps.signalWithStart(chatSession, {
-      workflowId: `chat:${body.sessionId}`,
+      workflowId: `${WF_PREFIX}${body.sessionId}`,
       taskQueue: deps.taskQueue,
       args: [body.sessionId, [], userId],
       signal: userMessageSignal,
@@ -115,7 +129,7 @@ export function makeApp(deps: {
       return c.json({ error: 'not found' }, 404);
     }
     try {
-      await deps.signalClose?.(`chat:${sessionId}`);
+      await deps.signalClose?.(`${WF_PREFIX}${sessionId}`);
     } catch { /* ignore */ }
     const ok = await deleteSession(sessionId, userId);
     if (!ok) return c.json({ error: 'not found' }, 404);
@@ -169,6 +183,12 @@ async function main() {
       try {
         await client.workflow.getHandle(workflowId).signal(closeSignal);
       } catch { /* ignore */ }
+    },
+    terminateLegacy: async (workflowId) => {
+      try {
+        await client.workflow.getHandle(workflowId).terminate('superseded by chat2 workflow shape');
+        console.log(`[webhook] terminated legacy workflow ${workflowId}`);
+      } catch { /* not running — nothing to do */ }
     },
   });
 

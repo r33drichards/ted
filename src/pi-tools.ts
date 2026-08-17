@@ -1,9 +1,12 @@
 /**
- * Custom pi tools for the ted agent: mcp-js code execution (via its REST
+ * Tool definitions for the ted agent: mcp-js code execution (via its REST
  * sidecar), memory CRUD, and raw IRC commands.
+ *
+ * Tools are plain objects: the LLM-facing schema (given to pi-ai's stream
+ * call by the llmTurn activity) plus an execute() run by the executeTool
+ * activity. Each tool execution is its own Temporal activity.
  */
-import { Type } from 'typebox';
-import { defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
+import { Type, type TSchema } from '@earendil-works/pi-ai';
 import {
   setMemory,
   getMemory,
@@ -12,6 +15,13 @@ import {
   searchMemories,
   type MemoryTier,
 } from './db.js';
+
+export type TedTool = {
+  name: string;
+  description: string;
+  parameters: TSchema;
+  execute: (args: any) => Promise<{ text: string; isError?: boolean }>;
+};
 
 // REST sidecar of the mcp-js (mcp-v8) service. MCP_JS_URL points at the MCP
 // endpoint (…/mcp); the REST API lives at the same origin under /api.
@@ -25,10 +35,6 @@ const MCP_JS_ORIGIN = (() => {
 })();
 
 const RUN_JS_TIMEOUT_MS = Number(process.env.MCP_JS_TIMEOUT_MS ?? 120_000);
-
-function text(t: string) {
-  return { content: [{ type: 'text' as const, text: t }], details: {} };
-}
 
 async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   const res = await fetch(url, init);
@@ -84,11 +90,10 @@ const tierEnum = Type.Union([
   Type.Literal('long_term'),
 ]);
 
-export function createTedTools(userId: string): ToolDefinition<any, any, any>[] {
+export function createTedTools(userId: string): TedTool[] {
   return [
-    defineTool({
+    {
       name: 'run_js',
-      label: 'Run JavaScript',
       description:
         'Execute JavaScript in a sandboxed V8 runtime (mcp-js). State persists across calls ' +
         'within the same named session via heap snapshots. Returns console output. ' +
@@ -99,18 +104,17 @@ export function createTedTools(userId: string): ToolDefinition<any, any, any>[] 
           Type.String({ description: 'Named session for state persistence (default "ted")' }),
         ),
       }),
-      execute: async (_id, params) => {
+      execute: async (args) => {
         try {
-          return text(await runJs(params.code, params.session ?? 'ted'));
+          return { text: await runJs(String(args.code ?? ''), String(args.session ?? 'ted')) };
         } catch (err) {
-          return text(`run_js failed: ${(err as Error).message}`);
+          return { text: `run_js failed: ${(err as Error).message}`, isError: true };
         }
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'memory_set',
-      label: 'Save memory',
       description:
         'Create or update a memory. working = always in context, short_term = index in context, long_term = searchable.',
       parameters: Type.Object({
@@ -118,73 +122,68 @@ export function createTedTools(userId: string): ToolDefinition<any, any, any>[] 
         key: Type.String(),
         content: Type.String(),
       }),
-      execute: async (_id, params) => {
-        await setMemory(userId, params.tier as MemoryTier, params.key, params.content);
-        return text(`Memory "${params.key}" saved to ${params.tier}.`);
+      execute: async (args) => {
+        await setMemory(userId, args.tier as MemoryTier, args.key, args.content);
+        return { text: `Memory "${args.key}" saved to ${args.tier}.` };
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'memory_get',
-      label: 'Read memory',
       description: 'Read the full content of a memory by key.',
       parameters: Type.Object({ key: Type.String() }),
-      execute: async (_id, params) => {
-        const mem = await getMemory(userId, params.key);
-        if (!mem) return text(`No memory found with key "${params.key}".`);
-        return text(`[${mem.tier}] ${mem.key}:\n${mem.content}`);
+      execute: async (args) => {
+        const mem = await getMemory(userId, args.key);
+        if (!mem) return { text: `No memory found with key "${args.key}".` };
+        return { text: `[${mem.tier}] ${mem.key}:\n${mem.content}` };
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'memory_delete',
-      label: 'Delete memory',
       description: 'Delete a memory by key.',
       parameters: Type.Object({ key: Type.String() }),
-      execute: async (_id, params) => {
-        const ok = await deleteMemory(userId, params.key);
-        return text(ok ? `Deleted "${params.key}".` : `No memory "${params.key}".`);
+      execute: async (args) => {
+        const ok = await deleteMemory(userId, args.key);
+        return { text: ok ? `Deleted "${args.key}".` : `No memory "${args.key}".` };
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'memory_list',
-      label: 'List memories',
       description: 'List all memories, optionally filtered by tier.',
       parameters: Type.Object({ tier: Type.Optional(tierEnum) }),
-      execute: async (_id, params) => {
-        const mems = await listMemories(userId, params.tier as MemoryTier | undefined);
-        if (mems.length === 0) return text('No memories found.');
+      execute: async (args) => {
+        const mems = await listMemories(userId, args.tier as MemoryTier | undefined);
+        if (mems.length === 0) return { text: 'No memories found.' };
         const lines = mems.map((m) => {
           const preview = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
           return `[${m.tier}] ${m.key}: ${preview}`;
         });
-        return text(lines.join('\n'));
+        return { text: lines.join('\n') };
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'memory_search',
-      label: 'Search memories',
       description: 'Search memories by keyword across keys and content.',
       parameters: Type.Object({
         query: Type.String(),
         tier: Type.Optional(tierEnum),
       }),
-      execute: async (_id, params) => {
-        const results = await searchMemories(userId, params.query, params.tier as MemoryTier | undefined);
-        if (results.length === 0) return text(`No memories matching "${params.query}".`);
+      execute: async (args) => {
+        const results = await searchMemories(userId, args.query, args.tier as MemoryTier | undefined);
+        if (results.length === 0) return { text: `No memories matching "${args.query}".` };
         const lines = results.map((m) => {
           const preview = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
           return `[${m.tier}] ${m.key}: ${preview}`;
         });
-        return text(lines.join('\n'));
+        return { text: lines.join('\n') };
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'irc_raw',
-      label: 'Raw IRC command',
       description:
         'Send a raw IRC command via the IRC bridge. One line, no CR/LF. ' +
         'Examples: "JOIN #foo", "PART #foo :bye", "PRIVMSG #foo :hello there", ' +
@@ -192,22 +191,22 @@ export function createTedTools(userId: string): ToolDefinition<any, any, any>[] 
         'the bridge auto-starts a per-channel session (irc-<name without # or &>) ' +
         'so future privmsgs from that channel will arrive as new turns.',
       parameters: Type.Object({ line: Type.String() }),
-      execute: async (_id, params) => {
+      execute: async (args) => {
         const url = process.env.IRC_BRIDGE_URL;
-        if (!url) return text('IRC bridge not configured (IRC_BRIDGE_URL unset).');
+        if (!url) return { text: 'IRC bridge not configured (IRC_BRIDGE_URL unset).', isError: true };
         try {
           const res = await fetch(`${url}/irc/raw`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ line: params.line }),
+            body: JSON.stringify({ line: args.line }),
           });
           const body = await res.text();
-          if (!res.ok) return text(`IRC bridge ${res.status}: ${body}`);
-          return text(`IRC: ${params.line}`);
+          if (!res.ok) return { text: `IRC bridge ${res.status}: ${body}`, isError: true };
+          return { text: `IRC: ${args.line}` };
         } catch (err) {
-          return text(`IRC bridge unreachable: ${(err as Error).message}`);
+          return { text: `IRC bridge unreachable: ${(err as Error).message}`, isError: true };
         }
       },
-    }),
+    },
   ];
 }

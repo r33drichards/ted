@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { chatSession } from '../workflows.js';
 import { userMessageSignal, closeSignal, transcriptQuery } from '../signals.js';
-import type { StreamReq } from '../types.js';
+import type { LlmTurnReq, ExecuteToolReq } from '../activities.js';
 
 const workflowsPath = fileURLToPath(new URL('../workflows.ts', import.meta.url));
 
@@ -28,12 +28,42 @@ afterAll(async () => {
   await testEnv?.teardown();
 });
 
+function assistantMessage(text: string, toolCalls: Array<{ id: string; name: string; args: any }> = []) {
+  return {
+    role: 'assistant' as const,
+    content: [
+      ...(text ? [{ type: 'text' as const, text }] : []),
+      ...toolCalls.map((tc) => ({
+        type: 'toolCall' as const,
+        id: tc.id,
+        name: tc.name,
+        arguments: tc.args,
+      })),
+    ],
+    api: 'openai-completions',
+    provider: 'openrouter',
+    model: 'test-model',
+    usage: {
+      input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: toolCalls.length > 0 ? 'toolUse' : 'stop',
+    timestamp: Date.now(),
+  };
+}
+
+const noopActivities = {
+  persistTurn: async () => {},
+  generateTitle: async () => {},
+  endTurn: async () => {},
+};
+
 describe('chatSession workflow', () => {
   it('processes a single message and closes', async () => {
-    // Fake activity that echoes the last user turn.
-    const fakeStreamClaude = async (req: StreamReq): Promise<string> => {
-      const last = req.history[req.history.length - 1];
-      return `echo: ${last.content}`;
+    // Fake llmTurn that echoes the last user turn, no tool calls.
+    const fakeLlmTurn = async (req: LlmTurnReq) => {
+      const last = req.convo[req.convo.length - 1] as any;
+      return assistantMessage(`echo: ${last.content}`);
     };
 
     const worker = await Worker.create({
@@ -41,22 +71,21 @@ describe('chatSession workflow', () => {
       taskQueue: 'test-chat',
       workflowsPath: workflowsPath,
       activities: {
-        streamClaude: fakeStreamClaude,
-        persistTurn: async () => {},
-        generateTitle: async () => {},
+        ...noopActivities,
+        llmTurn: fakeLlmTurn,
+        executeTool: async () => { throw new Error('no tools expected'); },
       },
     });
 
     await worker.runUntil(async () => {
       const sessionId = randomUUID();
       const handle = await testEnv.client.workflow.start(chatSession, {
-        workflowId: `chat:${sessionId}`,
+        workflowId: `chat2:${sessionId}`,
         taskQueue: 'test-chat',
         args: [sessionId, []],
       });
 
       await handle.signal(userMessageSignal, 'hello');
-      // Poll transcript until assistant reply appears
       let transcript: { role: string; content: string }[] = [];
       for (let i = 0; i < 50; i++) {
         transcript = await handle.query(transcriptQuery);
@@ -73,20 +102,28 @@ describe('chatSession workflow', () => {
     });
   });
 
-  it('coalesces messages queued during a generation into one next turn', async () => {
-    // Activity that holds open until released, so we can signal mid-flight.
-    let releaseFirst!: () => void;
-    const firstDone = new Promise<void>((r) => { releaseFirst = r; });
-    let callCount = 0;
+  it('runs tool calls as activities and feeds results back', async () => {
+    const toolCallsSeen: string[] = [];
 
-    const fakeStreamClaude = async (req: StreamReq): Promise<string> => {
-      callCount++;
-      if (callCount === 1) {
-        await firstDone;
-        return 'first-reply';
+    // First LLM call requests a tool; second call answers using the result.
+    const fakeLlmTurn = async (req: LlmTurnReq) => {
+      const last = req.convo[req.convo.length - 1] as any;
+      if (last.role === 'toolResult') {
+        return assistantMessage(`tool said: ${last.content[0].text}`);
       }
-      const last = req.history[req.history.length - 1];
-      return `reply-to: ${last.content}`;
+      return assistantMessage('', [{ id: 'tc-1', name: 'run_js', args: { code: '1+1' } }]);
+    };
+
+    const fakeExecuteTool = async (req: ExecuteToolReq) => {
+      toolCallsSeen.push(req.toolName);
+      return {
+        role: 'toolResult' as const,
+        toolCallId: req.toolCallId,
+        toolName: req.toolName,
+        content: [{ type: 'text' as const, text: '2' }],
+        isError: false,
+        timestamp: Date.now(),
+      };
     };
 
     const worker = await Worker.create({
@@ -94,30 +131,79 @@ describe('chatSession workflow', () => {
       taskQueue: 'test-chat',
       workflowsPath: workflowsPath,
       activities: {
-        streamClaude: fakeStreamClaude,
-        persistTurn: async () => {},
-        generateTitle: async () => {},
+        ...noopActivities,
+        llmTurn: fakeLlmTurn,
+        executeTool: fakeExecuteTool,
       },
     });
 
     await worker.runUntil(async () => {
       const sessionId = randomUUID();
       const handle = await testEnv.client.workflow.start(chatSession, {
-        workflowId: `chat:${sessionId}`,
+        workflowId: `chat2:${sessionId}`,
+        taskQueue: 'test-chat',
+        args: [sessionId, []],
+      });
+
+      await handle.signal(userMessageSignal, 'what is 1+1?');
+      let transcript: { role: string; content: string }[] = [];
+      for (let i = 0; i < 50; i++) {
+        transcript = await handle.query(transcriptQuery);
+        if (transcript.some((m) => m.role === 'assistant')) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+
+      expect(toolCallsSeen).toEqual(['run_js']);
+      expect(transcript).toEqual([
+        { role: 'user', content: 'what is 1+1?' },
+        { role: 'assistant', content: 'tool said: 2' },
+      ]);
+
+      await handle.signal(closeSignal);
+      await handle.result();
+    });
+  });
+
+  it('coalesces messages queued during a generation into one next turn', async () => {
+    let releaseFirst!: () => void;
+    const firstDone = new Promise<void>((r) => { releaseFirst = r; });
+    let callCount = 0;
+
+    const fakeLlmTurn = async (req: LlmTurnReq) => {
+      callCount++;
+      if (callCount === 1) {
+        await firstDone;
+        return assistantMessage('first-reply');
+      }
+      const last = req.convo[req.convo.length - 1] as any;
+      return assistantMessage(`reply-to: ${last.content}`);
+    };
+
+    const worker = await Worker.create({
+      connection: testEnv.nativeConnection,
+      taskQueue: 'test-chat',
+      workflowsPath: workflowsPath,
+      activities: {
+        ...noopActivities,
+        llmTurn: fakeLlmTurn,
+        executeTool: async () => { throw new Error('no tools expected'); },
+      },
+    });
+
+    await worker.runUntil(async () => {
+      const sessionId = randomUUID();
+      const handle = await testEnv.client.workflow.start(chatSession, {
+        workflowId: `chat2:${sessionId}`,
         taskQueue: 'test-chat',
         args: [sessionId, []],
       });
 
       await handle.signal(userMessageSignal, 'msg-1');
-      // Wait a beat so the workflow enters streamClaude
       await new Promise((r) => setTimeout(r, 200));
-      // Queue two more while first generation is in flight
       await handle.signal(userMessageSignal, 'msg-2');
       await handle.signal(userMessageSignal, 'msg-3');
-      // Release the first generation
       releaseFirst();
 
-      // Wait for second generation to complete
       let transcript: { role: string; content: string }[] = [];
       for (let i = 0; i < 100; i++) {
         transcript = await handle.query(transcriptQuery);
