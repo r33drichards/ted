@@ -81,6 +81,11 @@ export async function llmTurn(req: LlmTurnReq): Promise<AssistantMessage> {
     'a turn inside reasoning.',
   ];
   if (memoryCtx) systemParts.push(memoryCtx);
+  // Operator-provided standing context (credentials, site details, …) set
+  // via the AGENT_CONTEXT env var on the service.
+  if (process.env.AGENT_CONTEXT) {
+    systemParts.push(`[Operator context]\n${process.env.AGENT_CONTEXT}`);
+  }
 
   const tools: Tool[] = createTedTools(req.userId).map((t) => ({
     name: t.name,
