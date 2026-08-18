@@ -154,8 +154,10 @@ export function createTedTools(userId: string): TedTool[] {
     {
       name: 'run_js',
       description:
-        'Execute JavaScript in a sandboxed V8 runtime (mcp-js). State persists across calls ' +
-        'within the same named session via heap snapshots. Returns console output. ' +
+        'Execute JavaScript in a sandboxed V8 runtime (mcp-js). Returns console output. ' +
+        'WebAssembly is available (heap persistence is off). Files you write under /work ' +
+        'persist across calls within the same named session (JS variables do not — write ' +
+        'state you need to keep to /work). ' +
         'fetch() has full network access, and external ES modules can be imported with ' +
         'npm:/jsr: specifiers or https URLs (resolved via esm.sh), e.g. ' +
         '`import git from "npm:isomorphic-git"`. node: builtins (node:path, node:buffer, ' +
