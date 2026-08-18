@@ -50,7 +50,20 @@ await sb.terminate();
 ```
 Sandbox create params: `secrets`, `timeoutMs`, `cpu`, `memoryMiB`, `outboundDomainAllowlist`, ….
 
-Service methods on `ModalClient`: `apps`, `functions`, `sandboxes`, `images`, `secrets`, `volumes`. Errors are typed classes — match with `instanceof`.
+Service methods on `ModalClient`: `apps`, `functions`, `sandboxes`, `images`, `secrets`, `volumes`, `cls` (deployed Python classes). Errors are typed classes — match with `instanceof`.
+
+## Example recipes (fetch the .ts for working code)
+
+The JS SDK is documented mainly by examples. When doing a specific task, fetch the matching file from `github.com/modal-labs/modal-client/blob/main/js/examples/` (raw: `raw.githubusercontent.com/modal-labs/modal-client/main/js/examples/<file>`):
+
+- Functions: `function-call.ts`, `function-spawn.ts`
+- Deployed classes (Cls): `cls-call.ts`, `cls-call-with-options.ts`, `cls-routing-region.ts`
+- Sandboxes: `sandbox.ts`, `sandbox-named.ts`, `sandbox-gpu.ts`, `sandbox-exec.ts`, `sandbox-poll.ts`, `sandbox-fs.ts`, `sandbox-secrets.ts`, `sandbox-volume.ts` / `sandbox-volume-ephemeral.ts`, `sandbox-cloud-bucket.ts`, `sandbox-tunnels.ts`, `sandbox-network-policy.ts`, `sandbox-private-image.ts`, `sandbox-connect-token.ts`, `sandbox-agent.ts` (running a coding agent in a Sandbox)
+- Filesystem snapshots: `sandbox-filesystem-snapshot.ts`, `sandbox-directory-snapshot.ts`, `sandbox-directory-snapshot-csek.ts`
+- Images: `image-building.ts`, `sandbox-prewarm.ts`
+- Observability: `telemetry.ts` (custom gRPC middleware for tracing)
+
+Full JS SDK API reference: https://modal.com/docs/sdk/js
 
 ## Docs
 
